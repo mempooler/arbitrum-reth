@@ -106,6 +106,14 @@ use crate::hashed_db::{
     KECCAK_EMPTY as HASHED_KECCAK_EMPTY, account_by_address, code_of, storage_at,
 };
 
+// The whole-chain path writes blocks with the same batching and the same per-block checks as the
+// binary `import-full` stream, so a datadir built from either is identical.
+use super::snapshot_full::{
+    BLOCK_BATCH, BlockSectionStats, PendingBlock, SnapshotDb, TX_BATCH, expect_pending,
+    flush_blocks, rename_changeset_files_to_header, run_stage,
+};
+use reth_stages::stages::{SenderRecoveryStage, TransactionLookupStage};
+
 // Storage v2 keys trie nodes with `PackedKeyAdapter` (v1 used `LegacyKeyAdapter`). The state root
 // is adapter-independent (the MPT hash of key→value), so the genesis root still validates; only the
 // on-disk trie-node key encoding changes. The v2 flag must be cached on the factory *before* this
@@ -200,8 +208,24 @@ pub struct SnapshotImportArgs {
 
     /// Blocks stream (`H <num> <hash> <headerRLP>` records) containing the canonical snapshot
     /// head. Its block number and state root must match the Classic export and `--expect`.
+    ///
+    /// A stream carrying only the head yields a head-state datadir. A stream covering `[0, P]`
+    /// (`reth-export --mode blocks --from 0 --to P`) additionally imports every block's bodies and
+    /// receipts, and then requires `--chain-info` and `--genesis`.
     #[arg(long, value_name = "FILE")]
     blocks: PathBuf,
+
+    /// Nitro `chaininfo.json` for the chain the snapshot came from.
+    ///
+    /// Required when `--blocks` covers more than the head: the datadir then has a real genesis at
+    /// block 0, so the chain spec has to be the chain's own rather than the head header standing in
+    /// for one.
+    #[arg(long = "chain-info", value_name = "PATH", requires = "genesis_json")]
+    chain_info: Option<PathBuf>,
+
+    /// Nitro `genesis.json` for the same chain. Required alongside `--chain-info`.
+    #[arg(long = "genesis", value_name = "PATH", requires = "chain_info")]
+    genesis_json: Option<PathBuf>,
 }
 
 /// Read hashed state from a converted Arbitrum reth MDBX snapshot.
@@ -414,13 +438,34 @@ pub fn import(args: SnapshotImportArgs) -> eyre::Result<()> {
     let expected = parse_b256(&args.expect)
         .map_err(|error| eyre::eyre!("invalid --expect state root: {error}"))?;
 
+    ensure_fresh_import_target(&args.out)?;
+
+    // Whole-chain mode is selected by supplying the chain's own spec. clap keeps the two flags
+    // together, so either both are present or neither is.
+    if let (Some(chain_info), Some(genesis_json)) = (&args.chain_info, &args.genesis_json) {
+        return import_whole_chain(&args, expected, chain_info, genesis_json);
+    }
+    import_head_only(&args, expected)
+}
+
+/// The original import: one head block wired in as though it were genesis, plus its state.
+///
+/// The datadir this produces has no block bodies, no receipts and no history; the node syncs
+/// forward from the head. `--blocks` must carry exactly that one block.
+fn import_head_only(args: &SnapshotImportArgs, expected: B256) -> eyre::Result<()> {
     let db_path = args.out.join("db");
     let static_files_path = args.out.join("static_files");
     let rocksdb_path = args.out.join("rocksdb");
     let preimage_path = db_path.join("preimage");
-    ensure_fresh_import_target(&args.out)?;
 
-    let head = read_head_header(&args.blocks)?;
+    let (head, blocks) = scan_head_header(&args.blocks)?;
+    if blocks > 1 {
+        eyre::bail!(
+            "--blocks carries {blocks} blocks, but no chain spec was supplied. Importing a whole \
+             chain needs --chain-info and --genesis, because the datadir then has a real genesis \
+             at block 0 rather than the head standing in for one."
+        );
+    }
     let preimage_policy = validate_snapshot_identity(expected, &head)?;
     let preimage_manifest = if preimage_policy.requires_preimages() {
         if !preimage_path.join("mdbx.dat").is_file() {
@@ -521,6 +566,170 @@ pub fn import(args: SnapshotImportArgs) -> eyre::Result<()> {
     }
     write_snapshot_import_manifest(&args.out, &head)?;
 
+    Ok(())
+}
+
+/// Import a whole chain: every block's header, body and receipts from 0 to `P`, plus the state at
+/// `P`.
+///
+/// The datadir this produces answers historical *block* queries across the whole range. It carries
+/// no changesets, so historical *state* below `P` is unavailable and is marked as such; that is the
+/// part a hash-scheme Nitro snapshot cannot supply, because it records no per-block state diffs.
+///
+/// Blocks are written before state, which is both the order the static files want and the order
+/// that lets the head header come back out of the database rather than being carried around.
+fn import_whole_chain(
+    args: &SnapshotImportArgs,
+    expected: B256,
+    chain_info_path: &Path,
+    genesis_path: &Path,
+) -> eyre::Result<()> {
+    let db_path = args.out.join("db");
+    let static_files_path = args.out.join("static_files");
+    let rocksdb_path = args.out.join("rocksdb");
+
+    let chain_info = std::fs::read(chain_info_path)
+        .map_err(|error| eyre::eyre!("read {}: {error}", chain_info_path.display()))?;
+    let genesis = std::fs::read(genesis_path)
+        .map_err(|error| eyre::eyre!("read {}: {error}", genesis_path.display()))?;
+    let (chain_spec, _init, _info) = crate::orbit_chain_from_files(&chain_info, &genesis)?;
+    let chain_spec = Arc::new(chain_spec);
+    tracing::info!(
+        chain = chain_spec.chain.id(),
+        genesis = %chain_spec.genesis_hash(),
+        "building a whole-chain datadir"
+    );
+
+    // Before the database exists, and before the blocks import that can run for hours: a state
+    // stream that cannot be imported should cost minutes to find out about, not a whole run. It
+    // needs no preimages here, because a whole-chain import is ArbOS 20 or newer by construction
+    // (checked against the head below, once the blocks have named it).
+    tracing::info!(path = ?args.state, "validating state stream before database creation");
+    let state_stats = preflight_state_stream(&args.state, None)?;
+    tracing::info!(
+        accounts = state_stats.accounts,
+        slots = state_stats.slots,
+        bytecodes = state_stats.bytecodes,
+        "state stream preflight complete"
+    );
+
+    std::fs::create_dir_all(&static_files_path)?;
+    std::fs::create_dir_all(&rocksdb_path)?;
+
+    tracing::info!(path = ?db_path, "opening MDBX");
+    let db = init_db(&db_path, DatabaseArguments::new(ClientVersion::default()))?;
+    let static_file_provider = StaticFileProvider::read_write(static_files_path.clone())?;
+    let rocksdb_provider = RocksDBProvider::builder(&rocksdb_path)
+        .with_default_tables()
+        .build()
+        .map_err(|e| eyre::eyre!("RocksDB open error: {e}"))?;
+
+    let factory: ProviderFactory<ArbNodeTypesWithDB> = ProviderFactory::new(
+        db,
+        chain_spec,
+        static_file_provider,
+        rocksdb_provider,
+        Runtime::test(),
+    )
+    .map_err(|e| eyre::eyre!("ProviderFactory::new: {e}"))?;
+
+    // Storage v2, cached before any write so every provider agrees, and persisted so the node reads
+    // v2 on boot rather than defaulting to v1.
+    factory.set_storage_settings_cache(StorageSettings::v2());
+    {
+        let provider_rw = factory.database_provider_rw()?;
+        provider_rw.write_storage_settings(StorageSettings::v2())?;
+        provider_rw
+            .commit()
+            .map_err(|e| eyre::eyre!("persist storage settings: {e}"))?;
+    }
+
+    tracing::info!(path = ?args.blocks, "importing blocks");
+    let blocks = write_chain_blocks(&factory, &args.blocks)?;
+    tracing::info!(
+        blocks = blocks.blocks,
+        transactions = blocks.transactions,
+        receipts = blocks.receipts,
+        range = format!("{}..={}", blocks.first_block, blocks.last_block),
+        "blocks imported"
+    );
+
+    // Read the head and genesis back rather than carrying them here, which also proves the blocks
+    // landed. The genesis hash is what reth's launch check compares against once the chain spec is
+    // the chain's own.
+    let (head, genesis_hash) = {
+        let provider = factory.provider()?;
+        let head = HeaderProvider::sealed_header(&provider, blocks.last_block)?
+            .ok_or_else(|| eyre::eyre!("block {} has no header after import", blocks.last_block))?;
+        let genesis = HeaderProvider::sealed_header(&provider, 0)?
+            .ok_or_else(|| eyre::eyre!("block 0 has no header after import"))?;
+        (
+            (head.number, head.hash(), head.header().clone()),
+            genesis.hash(),
+        )
+    };
+    let (head_num, head_hash) = (head.0, head.1);
+
+    let preimage_policy = validate_snapshot_identity(expected, &head)?;
+    if preimage_policy.requires_preimages() {
+        eyre::bail!(
+            "block {head_num} predates ArbOS 20, which a whole-chain import does not support: its \
+             storage wipes need a plaintext slot-preimage set for this exact snapshot"
+        );
+    }
+
+    tracing::info!(path = ?args.state, "streaming state import (storage v2)");
+    stream_import(&factory, &args.state, None)?;
+
+    tracing::info!("computing state root (may take several minutes for large states)");
+    let computed = compute_state_root_chunked(&factory)?;
+    println!("computed  = {computed:#x}");
+    println!("expected  = {expected:#x}");
+    if computed != expected {
+        eyre::bail!("state root mismatch: computed={computed:#x}, expected={expected:#x}");
+    }
+    println!("MATCH");
+
+    // The transaction-derived indices are built by running reth's own stages over the bodies just
+    // written, so they hold exactly what a forward sync would have produced.
+    run_stage(
+        &factory,
+        SenderRecoveryStage::default(),
+        head_num,
+        "sender recovery",
+    )?;
+    run_stage(
+        &factory,
+        TransactionLookupStage::default(),
+        head_num,
+        "transaction lookup",
+    )?;
+
+    // No changesets anywhere, so the segments need the empty-at-head treatment, and every block up
+    // to and including the head has to be marked as having no historical state.
+    init_empty_changeset_segments(&factory, head_num)?;
+    {
+        let provider_rw = factory.database_provider_rw()?;
+        let checkpoint = StageCheckpoint::new(head_num);
+        for stage in StageId::ALL {
+            provider_rw.save_stage_checkpoint(stage, checkpoint)?;
+        }
+        write_snapshot_history_boundaries(&provider_rw, head_num)?;
+        provider_rw
+            .commit()
+            .map_err(|e| eyre::eyre!("commit checkpoints: {e}"))?;
+    }
+
+    verify_head(&factory, head_num, head_hash)?;
+    // A real chain spec means reth's launch check compares against the true genesis, not the head.
+    verify_launch(&factory, genesis_hash)?;
+
+    drop(factory);
+    rename_changeset_files_to_header(&static_files_path)?;
+    for path in [&db_path, &static_files_path, &rocksdb_path] {
+        sync_directory(path)?;
+    }
+    write_snapshot_import_manifest(&args.out, &head)?;
     Ok(())
 }
 
@@ -743,12 +952,6 @@ pub fn repair_history(args: SnapshotRepairHistoryArgs) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Rename the changeset static-file segments so their on-disk name matches the
-/// `expected_block_range` recorded in their header, which is what reth resolves their path from.
-///
-/// Shared with the full-snapshot importer; it checks every segment file, not just the first.
-use super::snapshot_full::rename_changeset_files_to_header;
-
 /// Arbitrum One chain id.
 const ARB_ONE_CHAIN_ID: u64 = 42161;
 
@@ -786,25 +989,52 @@ fn arb_chain_spec_with_header(chain_id: u64, header: Header, hash: B256) -> Arc<
     Arc::new(spec)
 }
 
-/// Read the highest-numbered `H <num> <hash> <headerRLP>` record (the head/genesis header).
-fn read_head_header(path: &Path) -> eyre::Result<(u64, B256, Header)> {
+/// Read the highest-numbered `H <num> <hash> <headerRLP>` record (the head/genesis header), and
+/// count the blocks the stream carries so a caller can tell a head-only stream from a whole chain.
+fn scan_head_header(path: &Path) -> eyre::Result<((u64, B256, Header), u64)> {
     let reader = std::io::BufReader::new(File::open(path)?);
     let mut best: Option<(u64, B256, Header)> = None;
+    let mut blocks = 0u64;
     for (line_index, line) in reader.lines().enumerate() {
         let Some((num, hash, header)) = parse_header_record(&line?, line_index + 1)? else {
             continue;
         };
+        blocks += 1;
         if best.as_ref().map(|(n, ..)| num >= *n).unwrap_or(true) {
             best = Some((num, hash, header));
         }
     }
-    best.ok_or_else(|| eyre::eyre!("no H records in {path:?}"))
+    let head = best.ok_or_else(|| eyre::eyre!("no H records in {path:?}"))?;
+    Ok((head, blocks))
 }
 
-fn parse_header_record(
-    line: &str,
-    line_number: usize,
-) -> eyre::Result<Option<(u64, B256, Header)>> {
+/// Read the highest-numbered `H <num> <hash> <headerRLP>` record (the head/genesis header).
+fn read_head_header(path: &Path) -> eyre::Result<(u64, B256, Header)> {
+    Ok(scan_head_header(path)?.0)
+}
+
+/// One record of a blocks stream, still encoded.
+///
+/// Splitting the tokenising from the decoding lets the head-only path decode just the header it
+/// needs while the whole-chain path hands the same bytes to [`PendingBlock`].
+enum BlockRecord {
+    Header {
+        number: u64,
+        hash: B256,
+        rlp: Vec<u8>,
+    },
+    Body {
+        number: u64,
+        rlp: Vec<u8>,
+    },
+    Receipts {
+        number: u64,
+        rlp: Vec<u8>,
+    },
+}
+
+/// Tokenise one `H`/`B`/`R` line. Blank lines yield `None`; an unknown tag is an error.
+fn parse_block_record(line: &str, line_number: usize) -> eyre::Result<Option<BlockRecord>> {
     let mut parts = line.split_whitespace();
     let Some(tag) = parts.next() else {
         return Ok(None);
@@ -831,7 +1061,17 @@ fn parse_header_record(
         if !rlp_header.list || input.len() != rlp_header.payload_length {
             eyre::bail!("invalid {tag} RLP for block {num} at line {line_number}");
         }
-        return Ok(None);
+        return Ok(Some(if tag == "B" {
+            BlockRecord::Body {
+                number: num,
+                rlp: encoded,
+            }
+        } else {
+            BlockRecord::Receipts {
+                number: num,
+                rlp: encoded,
+            }
+        }));
     }
     if tag != "H" {
         eyre::bail!("unknown block record {tag:?} at line {line_number}");
@@ -854,12 +1094,15 @@ fn parse_header_record(
     if parts.next().is_some() {
         eyre::bail!("H: unexpected trailing fields at line {line_number}");
     }
-    let mut input = rlp.as_slice();
-    let header = Header::decode(&mut input)
-        .map_err(|error| eyre::eyre!("decode header {num} at line {line_number}: {error}"))?;
-    if !input.is_empty() {
-        eyre::bail!("trailing bytes after header RLP at line {line_number}");
-    }
+    Ok(Some(BlockRecord::Header {
+        number: num,
+        hash,
+        rlp,
+    }))
+}
+
+/// Check a decoded header authenticates the record that carried it (ADR-004 B1).
+fn check_header_identity(num: u64, hash: B256, header: &Header, at: &str) -> eyre::Result<()> {
     if header.number != num {
         eyre::bail!(
             "header number mismatch: record={num}, decoded={}",
@@ -868,9 +1111,29 @@ fn parse_header_record(
     }
     let computed_hash = header.hash_slow();
     if computed_hash != hash {
-        eyre::bail!("header hash mismatch at {num}: record={hash:#x}, decoded={computed_hash:#x}");
+        eyre::bail!(
+            "header hash mismatch at {num} ({at}): record={hash:#x}, decoded={computed_hash:#x}"
+        );
     }
-    Ok(Some((num, hash, header)))
+    Ok(())
+}
+
+fn parse_header_record(
+    line: &str,
+    line_number: usize,
+) -> eyre::Result<Option<(u64, B256, Header)>> {
+    let Some(BlockRecord::Header { number, hash, rlp }) = parse_block_record(line, line_number)?
+    else {
+        return Ok(None);
+    };
+    let mut input = rlp.as_slice();
+    let header = Header::decode(&mut input)
+        .map_err(|error| eyre::eyre!("decode header {number} at line {line_number}: {error}"))?;
+    if !input.is_empty() {
+        eyre::bail!("trailing bytes after header RLP at line {line_number}");
+    }
+    check_header_identity(number, hash, &header, &format!("line {line_number}"))?;
+    Ok(Some((number, hash, header)))
 }
 
 /// Launch-acceptance gate: runs `init_genesis` with validation against the converted DB.
@@ -892,6 +1155,131 @@ fn verify_launch(
             "init_genesis returned {got:#x}, expected {head_hash:#x}"
         ))
     }
+}
+
+/// Read-ahead over a whole-chain blocks stream, whose receipt lines are long.
+const BLOCK_STREAM_BUFFER: usize = 16 * 1024 * 1024;
+
+/// Import a blocks stream covering `[0, P]`: headers, bodies and receipts for every block.
+///
+/// Unlike [`write_head_blocks`], which wires a single head block in as though it were genesis, this
+/// builds a datadir with real block history. Each block is checked against its own header before it
+/// is written, and the writing itself is [`flush_blocks`], the same batching the binary
+/// `import-full` path uses, so both streams produce a byte-identical datadir from the same blocks.
+///
+/// Returns what was written; the caller reads the head header back out of the database.
+fn write_chain_blocks<DB: SnapshotDb>(
+    factory: &ProviderFactory<NodeTypesWithDBAdapter<ArbNode, DB>>,
+    path: &Path,
+) -> eyre::Result<BlockSectionStats> {
+    let reader = BufReader::with_capacity(BLOCK_STREAM_BUFFER, File::open(path)?);
+    let mut stats = BlockSectionStats::default();
+    let mut batch: Vec<PendingBlock> = Vec::with_capacity(BLOCK_BATCH);
+    let mut pending: Option<PendingBlock> = None;
+    let mut batch_txs = 0usize;
+    let mut next_tx_num = 0u64;
+    let mut first = true;
+    let mut previous: Option<u64> = None;
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let line_number = line_index + 1;
+        let Some(record) = parse_block_record(&line?, line_number)? else {
+            continue;
+        };
+        match record {
+            BlockRecord::Header { number, hash, rlp } => {
+                // Checked before anything is written: the static-file segments index by offset from
+                // their start, so a stream that begins above genesis or skips a block would misalign
+                // them rather than fail.
+                match previous {
+                    None if number != 0 => eyre::bail!(
+                        "blocks stream starts at {number}, but a whole-chain import needs it to \
+                         start at block 0; re-export with --from 0"
+                    ),
+                    Some(previous) if number != previous + 1 => eyre::bail!(
+                        "blocks stream jumps from {previous} to {number} at line {line_number}; \
+                         it must be contiguous and ascending"
+                    ),
+                    _ => {}
+                }
+                previous = Some(number);
+
+                if let Some(done) = pending.take() {
+                    batch_txs += done.body.as_ref().map_or(0, |b| b.transactions.len());
+                    batch.push(done);
+                }
+                if batch.len() >= BLOCK_BATCH || batch_txs >= TX_BATCH {
+                    flush_blocks(
+                        factory,
+                        &mut batch,
+                        &mut next_tx_num,
+                        &mut first,
+                        &mut stats,
+                    )?;
+                    batch_txs = 0;
+                }
+                let block = PendingBlock::open(number, hash, &rlp)?;
+                check_header_identity(number, hash, &block.header, &format!("line {line_number}"))?;
+                pending = Some(block);
+            }
+            BlockRecord::Body { number, rlp } => {
+                expect_pending(&mut pending, number, "body")?.attach_body(&rlp)?;
+            }
+            BlockRecord::Receipts { number, rlp } => {
+                expect_pending(&mut pending, number, "receipts")?.attach_receipts(&rlp)?;
+            }
+        }
+    }
+
+    if let Some(done) = pending.take() {
+        batch.push(done);
+    }
+    flush_blocks(
+        factory,
+        &mut batch,
+        &mut next_tx_num,
+        &mut first,
+        &mut stats,
+    )?;
+
+    if stats.blocks == 0 {
+        eyre::bail!("no H records in {path:?}");
+    }
+    Ok(stats)
+}
+
+/// Initialise the changeset segments for a datadir that carries no changesets at all.
+///
+/// Mirrors the three invariants spelled out in [`write_head_blocks`]: the segments must report the
+/// head as their highest block, their expected start must equal where their data really starts, and
+/// `csoff[0]` must map to the head. An explicit empty entry at the head satisfies all three.
+fn init_empty_changeset_segments(
+    factory: &ProviderFactory<ArbNodeTypesWithDB>,
+    head_num: u64,
+) -> eyre::Result<()> {
+    let provider_rw = factory.database_provider_rw()?;
+    let sfp = provider_rw.static_file_provider();
+    for seg in [
+        StaticFileSegment::AccountChangeSets,
+        StaticFileSegment::StorageChangeSets,
+    ] {
+        let mut w = sfp.get_writer(head_num, seg)?;
+        w.user_header_mut().set_expected_block_start(head_num);
+        match seg {
+            StaticFileSegment::AccountChangeSets => {
+                w.append_account_changeset(Vec::new(), head_num)?
+            }
+            StaticFileSegment::StorageChangeSets => {
+                w.append_storage_changeset(Vec::new(), head_num)?
+            }
+            _ => unreachable!(),
+        }
+        w.commit()?;
+    }
+    provider_rw
+        .commit()
+        .map_err(|e| eyre::eyre!("initialise changeset segments: {e}"))?;
+    Ok(())
 }
 
 /// Write every `H <num> <hash> <headerRLP>` record into the static-file Headers segment plus
@@ -1527,6 +1915,220 @@ mod tests {
         AccountReader, PruneCheckpointReader, StateProvider, TryIntoHistoricalStateProvider,
     };
 
+    /// Blocks 0..=2 as the text stream `reth-export --mode blocks` writes, where block 1 carries
+    /// transactions and receipts. Same fixtures as the binary importer's own block test, so the two
+    /// paths are compared on identical input.
+    fn chain_blocks_stream(dir: &Path) -> eyre::Result<(PathBuf, Vec<B256>)> {
+        use super::super::snapshot_full::tests::{
+            body_rlp, header, receipt_specs, stored_receipts_rlp, transactions,
+        };
+
+        let txs = transactions();
+        let rcpts = super::super::snapshot_full::tests::receipts();
+        let h0 = header(0, B256::ZERO, &[], &[]);
+        let hash0 = h0.hash_slow();
+        let h1 = header(1, hash0, &txs, &rcpts);
+        let hash1 = h1.hash_slow();
+        let h2 = header(2, hash1, &[], &[]);
+        let hash2 = h2.hash_slow();
+
+        let mut out = String::new();
+        for (header, hash, body, receipts) in [
+            (&h0, hash0, body_rlp(&[]), None),
+            (
+                &h1,
+                hash1,
+                body_rlp(&txs),
+                Some(stored_receipts_rlp(&receipt_specs())),
+            ),
+            (&h2, hash2, body_rlp(&[]), None),
+        ] {
+            out.push_str(&format!(
+                "H {} {:x} {}\n",
+                header.number,
+                hash,
+                hex::encode(alloy_rlp::encode(header))
+            ));
+            out.push_str(&format!("B {} {}\n", header.number, hex::encode(&body)));
+            if let Some(receipts) = receipts {
+                out.push_str(&format!("R {} {}\n", header.number, hex::encode(&receipts)));
+            }
+        }
+
+        let path = dir.join("blocks.stream");
+        std::fs::write(&path, out)?;
+        Ok((path, vec![hash0, hash1, hash2]))
+    }
+
+    fn chain_test_factory() -> ProviderFactory<
+        NodeTypesWithDBAdapter<
+            ArbNode,
+            Arc<reth_db::test_utils::TempDatabase<reth_db::DatabaseEnv>>,
+        >,
+    > {
+        use reth_provider::test_utils::create_test_provider_factory_with_node_types;
+        let factory = create_test_provider_factory_with_node_types::<ArbNode>(
+            super::super::snapshot_full::tests::spec(),
+        );
+        factory.set_storage_settings_cache(StorageSettings::v2());
+        let provider = factory.database_provider_rw().unwrap();
+        provider
+            .write_storage_settings(StorageSettings::v2())
+            .unwrap();
+        provider.commit().unwrap();
+        factory
+    }
+
+    #[test]
+    fn a_text_blocks_stream_lands_bodies_and_receipts_not_just_headers() -> eyre::Result<()> {
+        use reth_storage_api::{BlockBodyIndicesProvider, ReceiptProvider, TransactionsProvider};
+
+        let temp = tempfile::tempdir()?;
+        let (path, hashes) = chain_blocks_stream(temp.path())?;
+        let factory = chain_test_factory();
+
+        let stats = write_chain_blocks(&factory, &path)?;
+        assert_eq!(stats.blocks, 3);
+        assert_eq!(stats.transactions, 2);
+        assert_eq!(stats.receipts, 2);
+        assert_eq!((stats.first_block, stats.last_block), (0, 2));
+
+        let provider = factory.provider()?;
+        for (number, hash) in hashes.iter().enumerate() {
+            let sealed = HeaderProvider::sealed_header(&provider, number as u64)?
+                .unwrap_or_else(|| panic!("no header at {number}"));
+            assert_eq!(sealed.hash(), *hash, "block {number} hash");
+        }
+
+        // The head-only importer wrote `BlockBodyIndices::default()` for every block; these are the
+        // real ones, and they are what makes the receipts readable back.
+        let indices = provider.block_body_indices(1)?.expect("indices at 1");
+        assert_eq!((indices.first_tx_num, indices.tx_count), (0, 2));
+        assert_eq!(
+            provider
+                .transactions_by_block(1u64.into())?
+                .expect("txs at 1"),
+            super::super::snapshot_full::tests::transactions()
+        );
+        assert_eq!(
+            provider
+                .receipts_by_block(1u64.into())?
+                .expect("receipts at 1"),
+            super::super::snapshot_full::tests::receipts()
+        );
+        assert_eq!(
+            provider
+                .block_body_indices(2)?
+                .expect("indices at 2")
+                .first_tx_num,
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_whole_chain_stream_must_be_contiguous_and_start_at_zero() -> eyre::Result<()> {
+        use super::super::snapshot_full::tests::header;
+
+        let temp = tempfile::tempdir()?;
+        let write = |name: &str, headers: &[Header]| -> eyre::Result<PathBuf> {
+            let mut out = String::new();
+            for h in headers {
+                out.push_str(&format!(
+                    "H {} {:x} {}\n",
+                    h.number,
+                    h.hash_slow(),
+                    hex::encode(alloy_rlp::encode(h))
+                ));
+            }
+            let path = temp.path().join(name);
+            std::fs::write(&path, out)?;
+            Ok(path)
+        };
+
+        let h0 = header(0, B256::ZERO, &[], &[]);
+        let h1 = header(1, h0.hash_slow(), &[], &[]);
+        let h3 = header(3, h1.hash_slow(), &[], &[]);
+
+        // A gap would silently misalign the static-file segments, which index by offset.
+        let gap = write("gap.stream", &[h0.clone(), h1.clone(), h3])?;
+        let error = write_chain_blocks(&chain_test_factory(), &gap).unwrap_err();
+        assert!(
+            error.to_string().contains("jumps from 1 to 3"),
+            "unexpected error: {error}"
+        );
+
+        // Starting above genesis leaves the datadir with no block 0 for reth's launch check.
+        let headless = write("headless.stream", &[h1])?;
+        let error = write_chain_blocks(&chain_test_factory(), &headless).unwrap_err();
+        assert!(
+            error.to_string().contains("needs it to start at block 0"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn head_only_import_refuses_a_multi_block_stream() -> eyre::Result<()> {
+        use super::super::snapshot_full::tests::header;
+
+        let temp = tempfile::tempdir()?;
+        let out = temp.path().join("out");
+        let h0 = header(0, B256::ZERO, &[], &[]);
+        let h1 = header(1, h0.hash_slow(), &[], &[]);
+        let blocks = temp.path().join("blocks.stream");
+        std::fs::write(
+            &blocks,
+            format!(
+                "H 0 {:x} {}\nH 1 {:x} {}\n",
+                h0.hash_slow(),
+                hex::encode(alloy_rlp::encode(&h0)),
+                h1.hash_slow(),
+                hex::encode(alloy_rlp::encode(&h1)),
+            ),
+        )?;
+
+        let error = import(SnapshotImportArgs {
+            state: temp.path().join("unused-state.stream"),
+            out: out.clone(),
+            expect: format!("{:#x}", B256::ZERO),
+            blocks,
+            chain_info: None,
+            genesis_json: None,
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("--chain-info and --genesis"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !out.join("db/mdbx.dat").exists(),
+            "no database for a rejected stream"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn body_and_receipt_records_keep_their_payloads() -> eyre::Result<()> {
+        // The head-only parser validated these and threw them away; the whole-chain path needs the
+        // bytes back out.
+        let body = alloy_rlp::encode(&arbitrum_alloy_consensus::reth::ArbBlockBody {
+            transactions: Vec::new(),
+            ommers: Vec::new(),
+            withdrawals: None,
+        });
+        let line = format!("B 7 {}", hex::encode(&body));
+        let Some(BlockRecord::Body { number, rlp }) = parse_block_record(&line, 1)? else {
+            panic!("expected a body record");
+        };
+        assert_eq!(number, 7);
+        assert_eq!(rlp, body);
+
+        // And the head-only parser still skips them, so its behaviour is unchanged.
+        assert!(parse_header_record(&line, 1)?.is_none());
+        Ok(())
+    }
+
     #[test]
     fn preimage_batches_are_deduplicated_and_native_store_roundtrips() -> eyre::Result<()> {
         let temp = tempfile::tempdir()?;
@@ -1869,6 +2471,8 @@ mod tests {
             out: out.clone(),
             expect: format!("{:#x}", arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT),
             blocks,
+            chain_info: None,
+            genesis_json: None,
         })
         .unwrap_err();
         assert!(error.to_string().contains("pre-ArbOS 20 snapshot"));

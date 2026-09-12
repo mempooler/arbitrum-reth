@@ -61,6 +61,49 @@ A successful import writes `snapshot-import.json` only after the state root, sna
 
 Use `/data/head-block.stream` with `node --snapshot-head` when starting the converted datadir.
 
+## Whole-chain import
+
+The workflow above produces a datadir holding one block. To keep the chain's block history as well,
+export every block and pass the chain's own spec:
+
+```sh
+reth-export --mode state --rewind 512 /data/nitro/l2chaindata > /data/state.stream
+# --rewind reports the block P it settled on; give that same P to the blocks export.
+reth-export --mode blocks --from 0 --to <P> /data/nitro/l2chaindata > /data/blocks.stream
+
+arb-reth snapshot import \
+  --state /data/state.stream \
+  --blocks /data/blocks.stream \
+  --chain-info /data/chaininfo.json \
+  --genesis /data/genesis.json \
+  --out /data/chain \
+  --expect 0x<state root at P>
+```
+
+`--chain-info` and `--genesis` are what select this mode, and they are required for it. A head-only
+import stands the head header in for a genesis it does not have; once block 0 is really present the
+chain spec has to be the chain's own, so `--blocks` carrying more than one block without them is
+rejected rather than silently producing a datadir with a false genesis.
+
+`<P>` must be the block `--mode state --rewind N` reported exporting, or the state and the blocks
+describe different heads. `--mode blocks` needs no `--rewind` of its own once `--to` names that block
+explicitly.
+
+The stream must start at block 0 and be contiguous. reth's static-file segments are indexed by
+offset from the segment start rather than by block number, so a gap or a late start would misalign
+them silently; both are rejected before anything is written.
+
+What this datadir has that a head-only one does not:
+
+- Every block's header, body and receipts, so historical block and transaction queries work.
+- Sender and transaction-lookup indices, built by running reth's own stages over the imported bodies.
+
+What it still does not have is per-block **state** history. A hash-scheme Nitro snapshot records no
+per-block state diffs, so there are no changesets to convert and historical *state* queries below the
+head are unavailable — the import marks that boundary explicitly. A path-scheme snapshot carries
+those diffs in its `ancient/state` freezer; convert one of those with `snapshot import-full`
+instead, which turns them into reth changesets.
+
 ## Storage V2 preimages
 
 The Nitro state stream contains hashed storage keys, but Storage V2 changesets use plain slot keys. Before ArbOS 20, those plain keys are required to record reversible storage wipes. The canonical Classic Export supplies the complete set for Nitro genesis.

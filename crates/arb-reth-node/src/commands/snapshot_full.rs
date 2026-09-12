@@ -76,11 +76,11 @@ const STREAM_BUFFER: usize = 16 * 1024 * 1024;
 
 /// Blocks accumulated before a database transaction is committed. Bounds dirty-page growth over a
 /// chain of tens of millions of blocks.
-const BLOCK_BATCH: usize = 4_000;
+pub(crate) const BLOCK_BATCH: usize = 4_000;
 
 /// Transactions accumulated before committing early, for chains whose blocks are much fuller than
 /// Arbitrum's average of roughly one transaction each.
-const TX_BATCH: usize = 50_000;
+pub(crate) const TX_BATCH: usize = 50_000;
 
 /// Changeset entries (accounts plus slots) accumulated before a commit. Blocks are batched by
 /// entries rather than by count because a single block's diff can be very large.
@@ -423,7 +423,7 @@ fn finalize<DB: SnapshotDb>(
 ///
 /// A stage may return before reaching the target when it has done a batch's worth of work, so it is
 /// re-entered from its own checkpoint until it reports done.
-fn run_stage<DB, S>(
+pub(crate) fn run_stage<DB, S>(
     factory: &ProviderFactory<NodeTypesWithDBAdapter<ArbNode, DB>>,
     mut stage: S,
     target: u64,
@@ -570,12 +570,89 @@ fn open_factory(
 }
 
 /// One block's records, gathered until the next header shows the block is complete.
-struct PendingBlock {
-    number: u64,
-    hash: B256,
-    header: Header,
-    body: Option<ArbBlockBody>,
-    receipts: Option<Vec<arbitrum_alloy_consensus::receipt::ArbReceiptEnvelope>>,
+///
+/// Shared with the line-oriented importer in `snapshot.rs`, which builds the same value out of
+/// `H`/`B`/`R` text records so both streams reach `flush_blocks` by the same route.
+pub(crate) struct PendingBlock {
+    pub(crate) number: u64,
+    pub(crate) hash: B256,
+    pub(crate) header: Header,
+    pub(crate) body: Option<ArbBlockBody>,
+    pub(crate) receipts: Option<Vec<arbitrum_alloy_consensus::receipt::ArbReceiptEnvelope>>,
+}
+
+impl PendingBlock {
+    /// Open a block on its decoded header, checking the header knows its own number.
+    pub(crate) fn open(block: u64, hash: B256, rlp: &[u8]) -> eyre::Result<Self> {
+        let mut input = rlp;
+        let header = Header::decode(&mut input)
+            .map_err(|error| eyre::eyre!("block {block}: decode header: {error}"))?;
+        if !input.is_empty() {
+            return Err(eyre::eyre!(
+                "block {block}: trailing bytes after the header"
+            ));
+        }
+        if header.number != block {
+            return Err(eyre::eyre!(
+                "block {block}: header says it is block {}",
+                header.number
+            ));
+        }
+        Ok(Self {
+            number: block,
+            hash,
+            header,
+            body: None,
+            receipts: None,
+        })
+    }
+
+    /// Decode the body and check it against the header's `transactionsRoot` (ADR-004 B2).
+    ///
+    /// The root is recomputed from the decoded transactions rather than trusted, so a match also
+    /// proves the decode was faithful.
+    pub(crate) fn attach_body(&mut self, rlp: &[u8]) -> eyre::Result<()> {
+        let block = self.number;
+        let mut input = rlp;
+        let body = ArbBlockBody::decode(&mut input)
+            .map_err(|error| eyre::eyre!("block {block}: decode body: {error}"))?;
+        if !input.is_empty() {
+            return Err(eyre::eyre!("block {block}: trailing bytes after the body"));
+        }
+        let root = calculate_transaction_root(&body.transactions);
+        if root != self.header.transactions_root {
+            return Err(eyre::eyre!(
+                "block {block}: transactions root is {root:#x}, header commits to {:#x}",
+                self.header.transactions_root
+            ));
+        }
+        self.body = Some(body);
+        Ok(())
+    }
+
+    /// Decode the receipts and check them against the header's `receiptsRoot` (ADR-004 B2).
+    ///
+    /// The stored form carries no transaction type, so the body has to have arrived first; both
+    /// exporters write them in that order for every block.
+    pub(crate) fn attach_receipts(&mut self, rlp: &[u8]) -> eyre::Result<()> {
+        let block = self.number;
+        let body = self
+            .body
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("block {block}: receipts arrived without a body"))?;
+        let tx_types: Vec<u8> = body.transactions.iter().map(tx_type_byte).collect();
+        let receipts = decode_stored_receipts(rlp, &tx_types)
+            .map_err(|error| eyre::eyre!("block {block}: {error}"))?;
+        let root = calculate_receipt_root(&receipts);
+        if root != self.header.receipts_root {
+            return Err(eyre::eyre!(
+                "block {block}: receipts root is {root:#x}, header commits to {:#x}",
+                self.header.receipts_root
+            ));
+        }
+        self.receipts = Some(receipts);
+        Ok(())
+    }
 }
 
 /// Write the blocks section: headers, bodies and receipts for `[B_lo, P]`.
@@ -615,64 +692,13 @@ fn write_blocks<R: Read, DB: SnapshotDb>(
                     batch_txs = 0;
                 }
 
-                let mut input = rlp.as_slice();
-                let header = Header::decode(&mut input)
-                    .map_err(|error| eyre::eyre!("block {block}: decode header: {error}"))?;
-                if !input.is_empty() {
-                    return Err(eyre::eyre!(
-                        "block {block}: trailing bytes after the header"
-                    ));
-                }
-                if header.number != block {
-                    return Err(eyre::eyre!(
-                        "block {block}: header says it is block {}",
-                        header.number
-                    ));
-                }
-                pending = Some(PendingBlock {
-                    number: block,
-                    hash,
-                    header,
-                    body: None,
-                    receipts: None,
-                });
+                pending = Some(PendingBlock::open(block, hash, &rlp)?);
             }
             Some(Record::Body { block, rlp }) => {
-                let target = expect_pending(&mut pending, block, "body")?;
-                let mut input = rlp.as_slice();
-                let body = ArbBlockBody::decode(&mut input)
-                    .map_err(|error| eyre::eyre!("block {block}: decode body: {error}"))?;
-                if !input.is_empty() {
-                    return Err(eyre::eyre!("block {block}: trailing bytes after the body"));
-                }
-                let root = calculate_transaction_root(&body.transactions);
-                if root != target.header.transactions_root {
-                    return Err(eyre::eyre!(
-                        "block {block}: transactions root is {root:#x}, header commits to {:#x}",
-                        target.header.transactions_root
-                    ));
-                }
-                target.body = Some(body);
+                expect_pending(&mut pending, block, "body")?.attach_body(&rlp)?;
             }
             Some(Record::Receipts { block, rlp }) => {
-                let target = expect_pending(&mut pending, block, "receipts")?;
-                // The stored form carries no transaction type, so the body has to have arrived
-                // first. The exporter writes them in that order for every block.
-                let body = target
-                    .body
-                    .as_ref()
-                    .ok_or_else(|| eyre::eyre!("block {block}: receipts arrived without a body"))?;
-                let tx_types: Vec<u8> = body.transactions.iter().map(tx_type_byte).collect();
-                let receipts = decode_stored_receipts(&rlp, &tx_types)
-                    .map_err(|error| eyre::eyre!("block {block}: {error}"))?;
-                let root = calculate_receipt_root(&receipts);
-                if root != target.header.receipts_root {
-                    return Err(eyre::eyre!(
-                        "block {block}: receipts root is {root:#x}, header commits to {:#x}",
-                        target.header.receipts_root
-                    ));
-                }
-                target.receipts = Some(receipts);
+                expect_pending(&mut pending, block, "receipts")?.attach_receipts(&rlp)?;
             }
             other => {
                 if let Some(done) = pending.take() {
@@ -709,7 +735,7 @@ fn write_blocks<R: Read, DB: SnapshotDb>(
     Ok(stats)
 }
 
-fn expect_pending<'a>(
+pub(crate) fn expect_pending<'a>(
     pending: &'a mut Option<PendingBlock>,
     block: u64,
     what: &str,
@@ -732,7 +758,7 @@ fn tx_type_byte(tx: &arbitrum_alloy_consensus::transactions::ArbTxEnvelope) -> u
 }
 
 /// Commit one batch of complete blocks.
-fn flush_blocks<DB: SnapshotDb>(
+pub(crate) fn flush_blocks<DB: SnapshotDb>(
     factory: &ProviderFactory<NodeTypesWithDBAdapter<ArbNode, DB>>,
     batch: &mut Vec<PendingBlock>,
     next_tx_num: &mut u64,
@@ -1176,7 +1202,7 @@ pub(crate) fn rename_changeset_files_to_header(static_files: &std::path::Path) -
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use alloy_consensus::{Eip658Value, Receipt, ReceiptWithBloom, TxEip1559};
     use alloy_eips::Decodable2718;
     use alloy_primitives::{
@@ -1215,7 +1241,7 @@ mod tests {
         factory
     }
 
-    fn spec() -> Arc<ChainSpec> {
+    pub(crate) fn spec() -> Arc<ChainSpec> {
         use arb_revm::arbos_init::ArbosInitConfig;
         const CHAIN_CONFIG: &[u8] =
             include_bytes!("../../tests/fixtures/testnode_l2_chain_config.json");
@@ -1233,7 +1259,7 @@ mod tests {
 
     /// A signed EIP-1559 transaction and an Arbitrum deposit, so the test covers both a type the
     /// body wraps as a typed envelope and an Arbitrum-only type.
-    fn transactions() -> Vec<ArbTxEnvelope> {
+    pub(crate) fn transactions() -> Vec<ArbTxEnvelope> {
         use alloy_consensus::Signed;
         let signed = Signed::new_unhashed(
             TxEip1559 {
@@ -1276,7 +1302,7 @@ mod tests {
     }
 
     /// One receipt described once, so the stored bytes and the expected envelope cannot drift.
-    struct ReceiptSpec {
+    pub(crate) struct ReceiptSpec {
         tx_type: u8,
         success: bool,
         cumulative_gas_used: u64,
@@ -1284,7 +1310,7 @@ mod tests {
         logs: Vec<Log>,
     }
 
-    fn receipt_specs() -> Vec<ReceiptSpec> {
+    pub(crate) fn receipt_specs() -> Vec<ReceiptSpec> {
         vec![
             ReceiptSpec {
                 tx_type: 0x02,
@@ -1304,7 +1330,7 @@ mod tests {
     }
 
     /// The receipts as reth models them: bloom present, type carried by the envelope.
-    fn receipts() -> Vec<ArbReceiptEnvelope> {
+    pub(crate) fn receipts() -> Vec<ArbReceiptEnvelope> {
         receipt_specs()
             .into_iter()
             .map(|spec| {
@@ -1329,7 +1355,7 @@ mod tests {
 
     /// The same receipts in Nitro's storage form: no bloom, no type, plus `l1GasUsed`. This is what
     /// the exporter copies out of the freezer, so the test drives the real decode path.
-    fn stored_receipts_rlp(specs: &[ReceiptSpec]) -> Vec<u8> {
+    pub(crate) fn stored_receipts_rlp(specs: &[ReceiptSpec]) -> Vec<u8> {
         let mut items = Vec::new();
         for spec in specs {
             let mut fields = Vec::new();
@@ -1358,7 +1384,7 @@ mod tests {
         out
     }
 
-    fn body_rlp(transactions: &[ArbTxEnvelope]) -> Vec<u8> {
+    pub(crate) fn body_rlp(transactions: &[ArbTxEnvelope]) -> Vec<u8> {
         let body = ArbBlockBody {
             transactions: transactions.to_vec(),
             ommers: Vec::new(),
@@ -1367,7 +1393,7 @@ mod tests {
         alloy_rlp::encode(&body)
     }
 
-    fn header(
+    pub(crate) fn header(
         number: u64,
         parent_hash: B256,
         body: &[ArbTxEnvelope],
