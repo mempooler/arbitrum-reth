@@ -156,6 +156,9 @@ func main() {
 	arbitrumdata := flag.String("arbitrumdata", "", "for --mode resume-point: the snapshot's arbitrumdata directory")
 	l2Block := flag.Int64("l2-block", -1, "for --mode resume-point: the converted head (P)")
 	genesisBlock := flag.Uint64("genesis-block", 0, "for --mode resume-point: the chain's ArbOS GenesisBlockNum")
+	// Off by default. Rewinding changes which block the export describes, and that has to be
+	// a decision rather than a silent fallback.
+	rewind := flag.Uint64("rewind", 0, "if the head block's state is not on disk, walk back up to this many blocks to the newest block that has one and treat that as the head")
 	flag.Parse()
 	if flag.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "usage: reth-export <l2chaindata-dir> [--ancient DIR] [--mode diag|accounts] [--max N]")
@@ -194,6 +197,7 @@ func main() {
 		fatal("read head header", fmt.Errorf("nil header at %d", num))
 	}
 	fmt.Fprintf(os.Stderr, "head: block=%d hash=%s stateRoot=%s scheme=%q\n", num, headHash.Hex(), header.Root.Hex(), scheme)
+	headNum := num
 
 	// Build a read-only trie/state database matching the on-disk scheme.
 	var tdb *triedb.Database
@@ -207,7 +211,59 @@ func main() {
 	sdb := state.NewDatabase(tdb, nil)
 	st, err := state.New(header.Root, sdb)
 	if err != nil {
-		fatal("open state at head root", err)
+		// A geth database in hash scheme does not commit a state root every block. Trie nodes
+		// accumulate in the dirty cache and are written periodically and on a clean shutdown,
+		// and Nitro widens that window further through its state-saving skip settings, so a
+		// snapshot routinely carries a head block whose state was never written. The failure
+		// looks like `missing trie node <root> (path )` -- an empty path, meaning the root
+		// itself is absent rather than some child.
+		//
+		// Nitro never trips over this because it rewinds to the last available state when it
+		// starts. This is that same recovery, made explicit.
+		if *rewind == 0 {
+			fatal("open state at head root", fmt.Errorf("%w\n"+
+				"  the head block's state was never committed to disk, which is normal for a\n"+
+				"  snapshot taken from a running node. Retry with --rewind N to export from the\n"+
+				"  newest block below the head that does have one", err))
+		}
+		headErr := err
+		found := false
+		for back := uint64(1); back <= *rewind && back <= num; back++ {
+			n := num - back
+			hash := rawdb.ReadCanonicalHash(db, n)
+			if hash == (common.Hash{}) {
+				continue
+			}
+			h := rawdb.ReadHeader(db, hash, n)
+			if h == nil {
+				continue
+			}
+			candidate, cErr := state.New(h.Root, sdb)
+			if cErr != nil {
+				continue
+			}
+			// Move the head itself, not just the state. Every mode below keys off `num` and
+			// `header`, and `--mode blocks` defaults its range to the head, so rewinding them
+			// together is what keeps a state stream and a blocks stream describing the same
+			// block. Rewinding only the state would quietly pair a state at N with blocks at
+			// the original head, and the resulting datadir would have a head block whose state
+			// is not the one that was exported.
+			st, headHash, num, header = candidate, hash, n, h
+			found = true
+			break
+		}
+		if !found {
+			fatal("open state at head root", fmt.Errorf("%w\n"+
+				"  no committed state in the %d blocks below the head. Either the snapshot was\n"+
+				"  taken from a node that was not stopped cleanly, or it is pruned harder than\n"+
+				"  --rewind allows for", headErr, *rewind))
+		}
+		fmt.Fprintf(os.Stderr,
+			"rewound: head state missing; exporting block=%d hash=%s stateRoot=%s (%d behind head %d)\n",
+			num, headHash.Hex(), header.Root.Hex(), headNum-num, headNum)
+		fmt.Fprintf(os.Stderr,
+			"  pair this with: --mode blocks --rewind %d   (or --from/--to %d), and import with --expect %s\n",
+			*rewind, num, header.Root.Hex())
 	}
 
 	switch *mode {
