@@ -43,6 +43,27 @@ func fatal(msg string, err error) {
 	os.Exit(1)
 }
 
+// mustFlush flushes w and stops the export if anything went wrong writing it.
+//
+// A bufio.Writer latches its first error and silently turns every later write into a no-op, so
+// `defer w.Flush()` (which discards the result) converts a failing write -- a full disk, most
+// likely -- into a stream truncated at the last successful flush, with exit status 0. A consumer
+// then finds a half-written record millions of lines in and has no way to tell it from corruption.
+// Flush returns the latched error, so one checked call at the end reports a failure that happened
+// at any point during the run.
+func mustFlush(w *bufio.Writer) {
+	if err := w.Flush(); err != nil {
+		fatal("write stream (a truncated stream usually means the destination filled up)", err)
+	}
+}
+
+// mustWrite writes one record, failing loudly rather than silently dropping it.
+func mustWrite(w *bufio.Writer, format string, args ...any) {
+	if _, err := fmt.Fprintf(w, format, args...); err != nil {
+		fatal("write stream (a truncated stream usually means the destination filled up)", err)
+	}
+}
+
 // partitionBoundary returns the 32-byte big-endian key floor(2^256 * i / n), the lower bound of
 // the i-th of n equal account-key-space partitions.
 func partitionBoundary(i, n int) []byte {
@@ -378,7 +399,6 @@ func main() {
 			hi = uint64(*to)
 		}
 		w := bufio.NewWriterSize(os.Stdout, 1<<20)
-		defer w.Flush()
 		var nBlk uint64
 		for n := lo; n <= hi; n++ {
 			hash := rawdb.ReadCanonicalHash(db, n)
@@ -389,15 +409,19 @@ func main() {
 			if len(hdr) == 0 {
 				continue
 			}
-			fmt.Fprintf(w, "H %d %x %x\n", n, hash, hdr)
+			// Checked per block rather than only at the end: a whole-chain export runs for hours,
+			// and the run that fills the disk should stop there instead of spending the rest of
+			// them writing nothing.
+			mustWrite(w, "H %d %x %x\n", n, hash, hdr)
 			if body := rawdb.ReadBodyRLP(db, hash, n); len(body) > 0 {
-				fmt.Fprintf(w, "B %d %x\n", n, body)
+				mustWrite(w, "B %d %x\n", n, body)
 			}
 			if rcpts := rawdb.ReadReceiptsRLP(db, hash, n); len(rcpts) > 0 {
-				fmt.Fprintf(w, "R %d %x\n", n, rcpts)
+				mustWrite(w, "R %d %x\n", n, rcpts)
 			}
 			nBlk++
 		}
+		mustFlush(w)
 		fmt.Fprintf(os.Stderr, "exported %d blocks [%d..%d]\n", nBlk, lo, hi)
 	case "full-snapshot":
 		fullSnapshot(db, anc, sdb, tdb, *parallel, *tmpdir, *arbitrumdata, *genesisBlock, *cacheMB, *handles)
@@ -498,12 +522,12 @@ func exportHistory(ancientDir string, from, to uint64) {
 	}
 
 	w := bufio.NewWriterSize(os.Stdout, 1<<22)
-	defer w.Flush()
 	w.WriteString(histStreamMagic)
 
 	started := time.Now()
 	emitted, skipped, accounts, slots := streamHistoryRange(w, store, first, last, "history id")
 	w.WriteByte(histTagStreamEnd)
+	mustFlush(w)
 	fmt.Fprintf(os.Stderr, "exported history ids [%d..%d]: %d objects (%d genesis v0 skipped), %d accounts, %d slots in %s\n",
 		first, last, emitted, skipped, accounts, slots, time.Since(started).Truncate(time.Second))
 }
@@ -755,7 +779,6 @@ func fullSnapshot(db ethdb.Database, ancientDir string, sdb state.Database, tdb 
 	}
 
 	w := bufio.NewWriterSize(os.Stdout, 1<<22)
-	defer w.Flush()
 	w.WriteString(snapStreamMagic)
 
 	writeManifestSection(w, db, point, resume)
@@ -763,6 +786,7 @@ func fullSnapshot(db ethdb.Database, ancientDir string, sdb state.Database, tdb 
 	writeHistorySection(w, ancientDir, point)
 	writeStateSection(w, sdb, tdb, db, point, parallel, tmpDir)
 	w.WriteByte(snapSectionEnd)
+	mustFlush(w)
 }
 
 func writeManifestSection(w *bufio.Writer, db ethdb.Database, point convertPoint, resume *resumeCheckpoint) {

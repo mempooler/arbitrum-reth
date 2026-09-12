@@ -584,6 +584,18 @@ fn import_whole_chain(
     chain_info_path: &Path,
     genesis_path: &Path,
 ) -> eyre::Result<()> {
+    // Both checks first, because they cost one line and one byte. Everything after them either runs
+    // for minutes or creates files that make a retry need a clean target first.
+    check_stream_is_complete(&args.blocks)?;
+    let first_block = first_block_number(&args.blocks)?;
+    if first_block != 0 {
+        eyre::bail!(
+            "--blocks starts at block {first_block}, but a whole-chain import needs it to start at \
+             block 0. A stream holding only the head is what `reth-export --mode blocks` writes by \
+             default; re-export the whole range with `--from 0 --to {first_block}`."
+        );
+    }
+
     let db_path = args.out.join("db");
     let static_files_path = args.out.join("static_files");
     let rocksdb_path = args.out.join("rocksdb");
@@ -987,6 +999,51 @@ fn arb_chain_spec_with_header(chain_id: u64, header: Header, hash: B256) -> Arc<
     // Override the computed (alloc-derived, wrong) genesis header with the real one.
     spec.genesis_header = SealedHeader::new(header, hash);
     Arc::new(spec)
+}
+
+/// Reject a blocks stream whose last line was never finished.
+///
+/// An exporter killed mid-write, or one that filled the disk, leaves a final record cut in half.
+/// Parsing would find it only after importing everything before it, which on a whole chain is
+/// hours; the last byte of the file answers the same question immediately. A stream cut at a record
+/// boundary still ends in a newline and is not caught here, but that one leaves the head below `P`,
+/// which the state-root check rejects.
+fn check_stream_is_complete(path: &Path) -> eyre::Result<()> {
+    use std::io::{Seek, SeekFrom};
+
+    let mut file = File::open(path)?;
+    let len = file.seek(SeekFrom::End(0))?;
+    if len == 0 {
+        eyre::bail!("{path:?} is empty");
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    std::io::Read::read_exact(&mut file, &mut last)?;
+    if last[0] != b'\n' {
+        eyre::bail!(
+            "{path:?} ends mid-record, so the export that wrote it did not finish. The usual cause \
+             is the destination filling up: `reth-export` used to latch the write error and exit 0, \
+             leaving a stream truncated at the last flush. Check free space, re-export, and confirm \
+             the file ends with a newline before importing."
+        );
+    }
+    Ok(())
+}
+
+/// The number of the first block in a blocks stream, read from its first `H` record alone.
+///
+/// Cheap on purpose: a whole-chain import is rejected for starting above genesis, and finding that
+/// out should cost one line rather than a state-stream preflight and a created database.
+fn first_block_number(path: &Path) -> eyre::Result<u64> {
+    let reader = std::io::BufReader::new(File::open(path)?);
+    for (line_index, line) in reader.lines().enumerate() {
+        match parse_block_record(&line?, line_index + 1)? {
+            Some(BlockRecord::Header { number, .. }) => return Ok(number),
+            Some(_) => eyre::bail!("{path:?}: a body or receipt record precedes the first header"),
+            None => continue,
+        }
+    }
+    eyre::bail!("no H records in {path:?}")
 }
 
 /// Read the highest-numbered `H <num> <hash> <headerRLP>` record (the head/genesis header), and
@@ -2064,6 +2121,94 @@ mod tests {
         assert!(
             error.to_string().contains("needs it to start at block 0"),
             "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_stream_cut_mid_record_is_rejected_before_anything_is_created() -> eyre::Result<()> {
+        use super::super::snapshot_full::tests::{body_rlp, header};
+
+        let temp = tempfile::tempdir()?;
+        let out = temp.path().join("out");
+        let h0 = header(0, B256::ZERO, &[], &[]);
+        let complete = format!(
+            "H 0 {:x} {}\nB 0 {}\n",
+            h0.hash_slow(),
+            hex::encode(alloy_rlp::encode(&h0)),
+            hex::encode(body_rlp(&[]))
+        );
+
+        let whole = temp.path().join("whole.stream");
+        std::fs::write(&whole, &complete)?;
+        check_stream_is_complete(&whole)?;
+
+        // What a killed exporter leaves: the final record cut short, with no closing newline.
+        let cut = temp.path().join("cut.stream");
+        std::fs::write(&cut, &complete[..complete.len() - 12])?;
+        let error = check_stream_is_complete(&cut).unwrap_err();
+        assert!(
+            error.to_string().contains("ends mid-record"),
+            "unexpected error: {error}"
+        );
+
+        let error = import(SnapshotImportArgs {
+            state: temp.path().join("missing-state.stream"),
+            out: out.clone(),
+            expect: format!("{:#x}", B256::ZERO),
+            blocks: cut,
+            chain_info: Some(temp.path().join("chaininfo.json")),
+            genesis_json: Some(temp.path().join("genesis.json")),
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("ends mid-record"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !out.exists(),
+            "a rejected stream must leave no target behind"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_head_only_stream_is_rejected_before_anything_is_created() -> eyre::Result<()> {
+        use super::super::snapshot_full::tests::header;
+
+        let temp = tempfile::tempdir()?;
+        let out = temp.path().join("out");
+        // What `reth-export --mode blocks` writes by default: the head alone, high above genesis.
+        let head = header(55_813_699, B256::ZERO, &[], &[]);
+        let blocks = temp.path().join("head-block.stream");
+        std::fs::write(
+            &blocks,
+            format!(
+                "H {} {:x} {}\n",
+                head.number,
+                head.hash_slow(),
+                hex::encode(alloy_rlp::encode(&head))
+            ),
+        )?;
+        assert_eq!(first_block_number(&blocks)?, 55_813_699);
+
+        let error = import(SnapshotImportArgs {
+            // Deliberately absent: the block check must fire before the state stream is read.
+            state: temp.path().join("missing-state.stream"),
+            out: out.clone(),
+            expect: format!("{:#x}", B256::ZERO),
+            blocks,
+            chain_info: Some(temp.path().join("chaininfo.json")),
+            genesis_json: Some(temp.path().join("genesis.json")),
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("--from 0"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !out.exists(),
+            "a rejected stream must not leave a target that a retry would have to clean up"
         );
         Ok(())
     }
