@@ -6,6 +6,8 @@
 //! - `node`             the standalone Arbitrum node (feed / L1-derivation block producer + RPC)
 //! - `snapshot import`  import a Nitro genesis-state stream into reth MDBX
 //! - `snapshot import-full`  convert a full-snapshot stream (blocks + history + state)
+//! - `snapshot import-blocks` / `import-state`  the same whole-chain conversion in two steps, so a
+//!   chain whose blocks stream will not fit on disk can be imported a chunk at a time
 //! - `snapshot read`    read hashed-state from a converted snapshot
 //! - `genesis verify`   verify the Arbitrum One Nitro-genesis state root from the classic export
 //! - `genesis verify-export`  verify a `reth-export --mode state` stream (stdin)
@@ -21,7 +23,8 @@ use arb_reth_node::commands::{
     node::{ArbChainSpecParser, ArbNodeArgs},
     rewind::RewindArgs,
     snapshot::{
-        SnapshotBuildPreimagesArgs, SnapshotImportArgs, SnapshotReadArgs, SnapshotRepairHistoryArgs,
+        SnapshotBuildPreimagesArgs, SnapshotImportArgs, SnapshotImportBlocksArgs,
+        SnapshotImportStateArgs, SnapshotReadArgs, SnapshotRepairHistoryArgs,
     },
     snapshot_full::{SnapshotFinalizeArgs, SnapshotImportFullArgs},
 };
@@ -100,6 +103,10 @@ enum SnapshotSub {
     Import(SnapshotImportArgs),
     /// Convert a `reth-export --mode full-snapshot` stream into a reth datadir.
     ImportFull(SnapshotImportFullArgs),
+    /// Append a range of blocks to a whole-chain datadir; run once per chunk.
+    ImportBlocks(SnapshotImportBlocksArgs),
+    /// Import the state into a block-complete datadir and finish the conversion.
+    ImportState(SnapshotImportStateArgs),
     /// Finish a converted datadir that stopped after its state root.
     Finalize(SnapshotFinalizeArgs),
     /// Read hashed-state from a converted Arbitrum reth MDBX snapshot.
@@ -216,6 +223,8 @@ fn main() -> eyre::Result<()> {
             SnapshotSub::BuildPreimages(args) => commands::snapshot::build_preimages(args),
             SnapshotSub::Import(args) => commands::snapshot::import(args),
             SnapshotSub::ImportFull(args) => commands::snapshot_full::import_full(args),
+            SnapshotSub::ImportBlocks(args) => commands::snapshot::import_blocks(args),
+            SnapshotSub::ImportState(args) => commands::snapshot::import_state(args),
             SnapshotSub::Finalize(args) => commands::snapshot_full::finalize_datadir(args),
             SnapshotSub::Read(args) => commands::snapshot::read(args),
             SnapshotSub::RepairHistory(args) => commands::snapshot::repair_history(args),

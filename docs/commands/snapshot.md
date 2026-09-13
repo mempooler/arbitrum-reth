@@ -104,6 +104,41 @@ head are unavailable — the import marks that boundary explicitly. A path-schem
 those diffs in its `ancient/state` freezer; convert one of those with `snapshot import-full`
 instead, which turns them into reth changesets.
 
+### Chunked conversion
+
+The blocks stream for a large chain is the biggest thing in the conversion by far — on a 55M-block
+Arbitrum chain it runs to roughly 1.5 TB of hex, against ~50 GB for the state stream. When it will
+not fit alongside both databases, import it a range at a time instead: `import-blocks` appends to the
+datadir, so the stream only has to hold one chunk at a time.
+
+```sh
+DIR=/data/chain
+P=55813699
+SPEC="--chain-info /data/chaininfo.json --genesis /data/genesis.json"
+
+for lo in $(seq 0 5000000 $P); do
+  hi=$(( lo + 4999999 )); [ $hi -gt $P ] && hi=$P
+  reth-export --mode blocks --from $lo --to $hi /data/nitro/l2chaindata > /data/chunk.stream
+  arb-reth snapshot import-blocks --blocks /data/chunk.stream --out $DIR $SPEC
+  rm /data/chunk.stream
+done
+
+arb-reth snapshot import-state --state /data/state.stream --out $DIR $SPEC \
+  --expect 0x<state root at P>
+```
+
+Each chunk must start where the datadir left off, and the first must start at block 0. Blocks the
+datadir already holds are skipped rather than rejected, so **a chunk that failed part-way can simply
+be re-run**: blocks are committed in batches, and the highest header present decides where the next
+one resumes. `import-blocks` reports what it skipped.
+
+Until `import-state` runs, the datadir has no completion manifest and the node refuses to boot it, so
+a conversion interrupted between chunks cannot be mistaken for a finished database.
+
+The peak disk requirement is the Nitro database plus the reth datadir plus one chunk. The Nitro
+database has to stay readable for the whole conversion — the blocks come from its freezer and the
+state from its trie — so it cannot be deleted partway to make room.
+
 ## Storage V2 preimages
 
 The Nitro state stream contains hashed storage keys, but Storage V2 changesets use plain slot keys. Before ArbOS 20, those plain keys are required to record reversible storage wipes. The canonical Classic Export supplies the complete set for Nitro genesis.

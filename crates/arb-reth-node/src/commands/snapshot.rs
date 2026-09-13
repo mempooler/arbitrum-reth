@@ -110,9 +110,10 @@ use crate::hashed_db::{
 // binary `import-full` stream, so a datadir built from either is identical.
 use super::snapshot_full::{
     BLOCK_BATCH, BlockSectionStats, PendingBlock, SnapshotDb, TX_BATCH, expect_pending,
-    flush_blocks, rename_changeset_files_to_header, run_stage,
+    flush_blocks, open_factory, rename_changeset_files_to_header, run_stage,
 };
 use reth_stages::stages::{SenderRecoveryStage, TransactionLookupStage};
+use reth_storage_api::BlockBodyIndicesProvider;
 
 // Storage v2 keys trie nodes with `PackedKeyAdapter` (v1 used `LegacyKeyAdapter`). The state root
 // is adapter-independent (the MPT hash of key→value), so the genesis root still validates; only the
@@ -226,6 +227,62 @@ pub struct SnapshotImportArgs {
     /// Nitro `genesis.json` for the same chain. Required alongside `--chain-info`.
     #[arg(long = "genesis", value_name = "PATH", requires = "chain_info")]
     genesis_json: Option<PathBuf>,
+}
+
+/// Append a range of blocks to a whole-chain snapshot datadir.
+#[derive(Debug, Parser)]
+#[command(
+    name = "arb-snapshot-import-blocks",
+    about = "Append a range of blocks to a whole-chain snapshot datadir"
+)]
+pub struct SnapshotImportBlocksArgs {
+    /// Blocks stream (`H`/`B`/`R` records) for one contiguous range.
+    ///
+    /// The first chunk must start at block 0; each later one must start where the datadir left off.
+    /// Re-running a chunk the datadir already holds is a no-op, so an interrupted run can simply be
+    /// repeated.
+    #[arg(long, value_name = "FILE")]
+    blocks: PathBuf,
+
+    /// Datadir to create or append to.
+    #[arg(long, value_name = "DIR")]
+    out: PathBuf,
+
+    /// Nitro `chaininfo.json` for the chain the snapshot came from.
+    #[arg(long = "chain-info", value_name = "PATH")]
+    chain_info: PathBuf,
+
+    /// Nitro `genesis.json` for the same chain.
+    #[arg(long = "genesis", value_name = "PATH")]
+    genesis_json: PathBuf,
+}
+
+/// Import the state into a datadir whose blocks are already in place, and finish it.
+#[derive(Debug, Parser)]
+#[command(
+    name = "arb-snapshot-import-state",
+    about = "Import the state into a block-complete datadir and finish the conversion"
+)]
+pub struct SnapshotImportStateArgs {
+    /// Nitro state stream (`A`/`C`/`S` records) at the datadir's head block.
+    #[arg(long, value_name = "FILE")]
+    state: PathBuf,
+
+    /// Datadir previously filled by `snapshot import-blocks`.
+    #[arg(long, value_name = "DIR")]
+    out: PathBuf,
+
+    /// Expected state root (hex, with or without 0x prefix). Must match the head block's.
+    #[arg(long, value_name = "HEX")]
+    expect: String,
+
+    /// Nitro `chaininfo.json` for the chain the snapshot came from.
+    #[arg(long = "chain-info", value_name = "PATH")]
+    chain_info: PathBuf,
+
+    /// Nitro `genesis.json` for the same chain.
+    #[arg(long = "genesis", value_name = "PATH")]
+    genesis_json: PathBuf,
 }
 
 /// Read hashed state from a converted Arbitrum reth MDBX snapshot.
@@ -578,14 +635,273 @@ fn import_head_only(args: &SnapshotImportArgs, expected: B256) -> eyre::Result<(
 ///
 /// Blocks are written before state, which is both the order the static files want and the order
 /// that lets the head header come back out of the database rather than being carried around.
+/// Build the chain's own spec, which is what a datadir with a real genesis at block 0 needs.
+fn chain_spec_from_files(
+    chain_info_path: &Path,
+    genesis_path: &Path,
+) -> eyre::Result<Arc<ChainSpec>> {
+    let chain_info = std::fs::read(chain_info_path)
+        .map_err(|error| eyre::eyre!("read {}: {error}", chain_info_path.display()))?;
+    let genesis = std::fs::read(genesis_path)
+        .map_err(|error| eyre::eyre!("read {}: {error}", genesis_path.display()))?;
+    let (chain_spec, _init, _info) = crate::orbit_chain_from_files(&chain_info, &genesis)?;
+    Ok(Arc::new(chain_spec))
+}
+
+/// Allow appending to a conversion in progress, but never to a finished one.
+///
+/// The strict [`ensure_fresh_import_target`] is right for the first chunk and wrong for every one
+/// after it, whose whole purpose is to land in a datadir that already has blocks.
+fn ensure_appendable_import_target(out: &Path) -> eyre::Result<()> {
+    let manifest = out.join(SNAPSHOT_IMPORT_MANIFEST_FILE);
+    if manifest.exists() {
+        eyre::bail!(
+            "{} is already a finished import; its completion manifest is at {}",
+            out.display(),
+            manifest.display()
+        );
+    }
+    Ok(())
+}
+
+/// The gate for a datadir that may or may not already hold blocks.
+fn ensure_import_target(out: &Path) -> eyre::Result<bool> {
+    let resuming = out.join("static_files").exists();
+    if resuming {
+        ensure_appendable_import_target(out)?;
+    } else {
+        ensure_fresh_import_target(out)?;
+    }
+    Ok(resuming)
+}
+
+/// Append one chunk of blocks to a whole-chain datadir, creating it if it does not exist.
+///
+/// Split from the state import so a chain too large to stage on disk in one piece can be converted
+/// a range at a time: export a chunk, import it, delete it, repeat. Each chunk is committed as it
+/// goes, so an interrupted run resumes from the highest block already present rather than starting
+/// over.
+pub fn import_blocks(args: SnapshotImportBlocksArgs) -> eyre::Result<()> {
+    // Cheap checks before anything is opened or created.
+    check_stream_is_complete(&args.blocks)?;
+    let first_block = first_block_number(&args.blocks)?;
+    let resuming = ensure_import_target(&args.out)?;
+    if !resuming && first_block != 0 {
+        eyre::bail!(
+            "--blocks starts at block {first_block}, but this datadir is empty and the first chunk \
+             has to start at block 0. A stream holding only the head is what `reth-export --mode \
+             blocks` writes by default; re-export with `--from 0`."
+        );
+    }
+
+    let chain_spec = chain_spec_from_files(&args.chain_info, &args.genesis_json)?;
+    let db_path = args.out.join("db");
+    let static_files_path = args.out.join("static_files");
+    let rocksdb_path = args.out.join("rocksdb");
+    std::fs::create_dir_all(&static_files_path)?;
+    std::fs::create_dir_all(&rocksdb_path)?;
+    let factory = open_factory(&db_path, &static_files_path, &rocksdb_path, chain_spec)?;
+
+    let stats = append_blocks(&factory, &args.blocks)?;
+    drop(factory);
+    for path in [&db_path, &static_files_path, &rocksdb_path] {
+        sync_directory(path)?;
+    }
+
+    if stats.blocks > 0 {
+        println!(
+            "imported blocks {}..={} ({} transactions, {} receipts)",
+            stats.first_block, stats.last_block, stats.transactions, stats.receipts
+        );
+    } else {
+        println!("nothing to do; the datadir already holds these blocks");
+    }
+    Ok(())
+}
+
+/// Write one chunk into an open datadir, resuming from what it already holds.
+fn append_blocks<DB: SnapshotDb>(
+    factory: &ProviderFactory<NodeTypesWithDBAdapter<ArbNode, DB>>,
+    blocks: &Path,
+) -> eyre::Result<BlockSectionStats> {
+    let resume = read_block_resume(factory)?;
+    if !resume.fresh {
+        tracing::info!(
+            next_block = resume.next_block,
+            next_tx_num = resume.next_tx_num,
+            "appending to an existing datadir"
+        );
+    }
+    tracing::info!(path = ?blocks, "importing blocks");
+    let stats = write_chain_blocks(factory, blocks, resume)?;
+    if stats.blocks > 0 {
+        tracing::info!(
+            blocks = stats.blocks,
+            transactions = stats.transactions,
+            receipts = stats.receipts,
+            range = format!("{}..={}", stats.first_block, stats.last_block),
+            "blocks imported"
+        );
+    }
+    Ok(stats)
+}
+
+/// Import the state into a datadir whose blocks are already in place, then finish it.
+///
+/// This is the step that makes the datadir bootable: without its completion manifest the node
+/// refuses to open one, so a conversion interrupted between chunks cannot be mistaken for a
+/// finished database.
+pub fn import_state(args: SnapshotImportStateArgs) -> eyre::Result<()> {
+    let expected = parse_b256(&args.expect)
+        .map_err(|error| eyre::eyre!("invalid --expect state root: {error}"))?;
+    ensure_appendable_import_target(&args.out)?;
+
+    let static_files_path = args.out.join("static_files");
+    if !static_files_path.exists() {
+        eyre::bail!(
+            "{} holds no blocks yet; run `arb-reth snapshot import-blocks` first",
+            args.out.display()
+        );
+    }
+
+    // Before the state is written, and cheap relative to it.
+    tracing::info!(path = ?args.state, "validating state stream");
+    let state_stats = preflight_state_stream(&args.state, None)?;
+    tracing::info!(
+        accounts = state_stats.accounts,
+        slots = state_stats.slots,
+        bytecodes = state_stats.bytecodes,
+        "state stream preflight complete"
+    );
+
+    let chain_spec = chain_spec_from_files(&args.chain_info, &args.genesis_json)?;
+    let db_path = args.out.join("db");
+    let rocksdb_path = args.out.join("rocksdb");
+    let factory = open_factory(&db_path, &static_files_path, &rocksdb_path, chain_spec)?;
+
+    finish_whole_chain(
+        &factory,
+        &args.out,
+        &args.state,
+        expected,
+        &db_path,
+        &static_files_path,
+        &rocksdb_path,
+    )
+}
+
+/// The state import and everything that turns a datadir full of blocks into a bootable one.
+fn finish_whole_chain(
+    factory: &ProviderFactory<ArbNodeTypesWithDB>,
+    out: &Path,
+    state: &Path,
+    expected: B256,
+    db_path: &Path,
+    static_files_path: &Path,
+    rocksdb_path: &Path,
+) -> eyre::Result<()> {
+    // Read the head and genesis out of the datadir rather than being told them, which also proves
+    // the blocks landed. The genesis hash is what reth's launch check compares against once the
+    // chain spec is the chain's own.
+    let (head, genesis_hash) = {
+        let provider = factory.provider()?;
+        let highest = provider
+            .static_file_provider()
+            .get_highest_static_file_block(StaticFileSegment::Headers)
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "{} holds no blocks yet; run `arb-reth snapshot import-blocks` first",
+                    out.display()
+                )
+            })?;
+        let head = HeaderProvider::sealed_header(&provider, highest)?
+            .ok_or_else(|| eyre::eyre!("block {highest} has no header"))?;
+        let genesis = HeaderProvider::sealed_header(&provider, 0)?.ok_or_else(|| {
+            eyre::eyre!("block 0 has no header; the chain's first chunk is missing")
+        })?;
+        (
+            (head.number, head.hash(), head.header().clone()),
+            genesis.hash(),
+        )
+    };
+    let (head_num, head_hash) = (head.0, head.1);
+    tracing::info!(head_num, %head_hash, "finishing a whole-chain datadir");
+
+    // The head's own state root is what the state stream has to reproduce, so a blocks import that
+    // stopped short of `P` is caught here rather than after the trie is built.
+    let preimage_policy = validate_snapshot_identity(expected, &head)?;
+    if preimage_policy.requires_preimages() {
+        eyre::bail!(
+            "block {head_num} predates ArbOS 20, which a whole-chain import does not support: its \
+             storage wipes need a plaintext slot-preimage set for this exact snapshot"
+        );
+    }
+
+    tracing::info!(path = ?state, "streaming state import (storage v2)");
+    stream_import(factory, &state.to_path_buf(), None)?;
+
+    tracing::info!("computing state root (may take several minutes for large states)");
+    let computed = compute_state_root_chunked(factory)?;
+    println!("computed  = {computed:#x}");
+    println!("expected  = {expected:#x}");
+    if computed != expected {
+        eyre::bail!("state root mismatch: computed={computed:#x}, expected={expected:#x}");
+    }
+    println!("MATCH");
+
+    // The transaction-derived indices are built by running reth's own stages over the bodies that
+    // were imported, so they hold exactly what a forward sync would have produced.
+    run_stage(
+        factory,
+        SenderRecoveryStage::default(),
+        head_num,
+        "sender recovery",
+    )?;
+    run_stage(
+        factory,
+        TransactionLookupStage::default(),
+        head_num,
+        "transaction lookup",
+    )?;
+
+    // No changesets anywhere, so the segments need the empty-at-head treatment, and every block up
+    // to and including the head has to be marked as having no historical state.
+    init_empty_changeset_segments(factory, head_num)?;
+    {
+        let provider_rw = factory.database_provider_rw()?;
+        let checkpoint = StageCheckpoint::new(head_num);
+        for stage in StageId::ALL {
+            provider_rw.save_stage_checkpoint(stage, checkpoint)?;
+        }
+        write_snapshot_history_boundaries(&provider_rw, head_num)?;
+        provider_rw
+            .commit()
+            .map_err(|e| eyre::eyre!("commit checkpoints: {e}"))?;
+    }
+
+    verify_head(factory, head_num, head_hash)?;
+    // A real chain spec means reth's launch check compares against the true genesis, not the head.
+    verify_launch(factory, genesis_hash)?;
+
+    rename_changeset_files_to_header(static_files_path)?;
+    for path in [db_path, static_files_path, rocksdb_path] {
+        sync_directory(path)?;
+    }
+    write_snapshot_import_manifest(out, &head)?;
+    Ok(())
+}
+
+/// The one-shot whole-chain import: every block and the state in a single run.
+///
+/// Equivalent to `import-blocks` over the whole range followed by `import-state`, and worth using
+/// when the blocks stream fits on disk in one piece. When it does not, run the two separately and
+/// feed the first one chunk at a time.
 fn import_whole_chain(
     args: &SnapshotImportArgs,
     expected: B256,
     chain_info_path: &Path,
     genesis_path: &Path,
 ) -> eyre::Result<()> {
-    // Both checks first, because they cost one line and one byte. Everything after them either runs
-    // for minutes or creates files that make a retry need a clean target first.
     check_stream_is_complete(&args.blocks)?;
     let first_block = first_block_number(&args.blocks)?;
     if first_block != 0 {
@@ -596,16 +912,7 @@ fn import_whole_chain(
         );
     }
 
-    let db_path = args.out.join("db");
-    let static_files_path = args.out.join("static_files");
-    let rocksdb_path = args.out.join("rocksdb");
-
-    let chain_info = std::fs::read(chain_info_path)
-        .map_err(|error| eyre::eyre!("read {}: {error}", chain_info_path.display()))?;
-    let genesis = std::fs::read(genesis_path)
-        .map_err(|error| eyre::eyre!("read {}: {error}", genesis_path.display()))?;
-    let (chain_spec, _init, _info) = crate::orbit_chain_from_files(&chain_info, &genesis)?;
-    let chain_spec = Arc::new(chain_spec);
+    let chain_spec = chain_spec_from_files(chain_info_path, genesis_path)?;
     tracing::info!(
         chain = chain_spec.chain.id(),
         genesis = %chain_spec.genesis_hash(),
@@ -625,124 +932,25 @@ fn import_whole_chain(
         "state stream preflight complete"
     );
 
+    let db_path = args.out.join("db");
+    let static_files_path = args.out.join("static_files");
+    let rocksdb_path = args.out.join("rocksdb");
     std::fs::create_dir_all(&static_files_path)?;
     std::fs::create_dir_all(&rocksdb_path)?;
 
     tracing::info!(path = ?db_path, "opening MDBX");
-    let db = init_db(&db_path, DatabaseArguments::new(ClientVersion::default()))?;
-    let static_file_provider = StaticFileProvider::read_write(static_files_path.clone())?;
-    let rocksdb_provider = RocksDBProvider::builder(&rocksdb_path)
-        .with_default_tables()
-        .build()
-        .map_err(|e| eyre::eyre!("RocksDB open error: {e}"))?;
+    let factory = open_factory(&db_path, &static_files_path, &rocksdb_path, chain_spec)?;
 
-    let factory: ProviderFactory<ArbNodeTypesWithDB> = ProviderFactory::new(
-        db,
-        chain_spec,
-        static_file_provider,
-        rocksdb_provider,
-        Runtime::test(),
+    append_blocks(&factory, &args.blocks)?;
+    finish_whole_chain(
+        &factory,
+        &args.out,
+        &args.state,
+        expected,
+        &db_path,
+        &static_files_path,
+        &rocksdb_path,
     )
-    .map_err(|e| eyre::eyre!("ProviderFactory::new: {e}"))?;
-
-    // Storage v2, cached before any write so every provider agrees, and persisted so the node reads
-    // v2 on boot rather than defaulting to v1.
-    factory.set_storage_settings_cache(StorageSettings::v2());
-    {
-        let provider_rw = factory.database_provider_rw()?;
-        provider_rw.write_storage_settings(StorageSettings::v2())?;
-        provider_rw
-            .commit()
-            .map_err(|e| eyre::eyre!("persist storage settings: {e}"))?;
-    }
-
-    tracing::info!(path = ?args.blocks, "importing blocks");
-    let blocks = write_chain_blocks(&factory, &args.blocks)?;
-    tracing::info!(
-        blocks = blocks.blocks,
-        transactions = blocks.transactions,
-        receipts = blocks.receipts,
-        range = format!("{}..={}", blocks.first_block, blocks.last_block),
-        "blocks imported"
-    );
-
-    // Read the head and genesis back rather than carrying them here, which also proves the blocks
-    // landed. The genesis hash is what reth's launch check compares against once the chain spec is
-    // the chain's own.
-    let (head, genesis_hash) = {
-        let provider = factory.provider()?;
-        let head = HeaderProvider::sealed_header(&provider, blocks.last_block)?
-            .ok_or_else(|| eyre::eyre!("block {} has no header after import", blocks.last_block))?;
-        let genesis = HeaderProvider::sealed_header(&provider, 0)?
-            .ok_or_else(|| eyre::eyre!("block 0 has no header after import"))?;
-        (
-            (head.number, head.hash(), head.header().clone()),
-            genesis.hash(),
-        )
-    };
-    let (head_num, head_hash) = (head.0, head.1);
-
-    let preimage_policy = validate_snapshot_identity(expected, &head)?;
-    if preimage_policy.requires_preimages() {
-        eyre::bail!(
-            "block {head_num} predates ArbOS 20, which a whole-chain import does not support: its \
-             storage wipes need a plaintext slot-preimage set for this exact snapshot"
-        );
-    }
-
-    tracing::info!(path = ?args.state, "streaming state import (storage v2)");
-    stream_import(&factory, &args.state, None)?;
-
-    tracing::info!("computing state root (may take several minutes for large states)");
-    let computed = compute_state_root_chunked(&factory)?;
-    println!("computed  = {computed:#x}");
-    println!("expected  = {expected:#x}");
-    if computed != expected {
-        eyre::bail!("state root mismatch: computed={computed:#x}, expected={expected:#x}");
-    }
-    println!("MATCH");
-
-    // The transaction-derived indices are built by running reth's own stages over the bodies just
-    // written, so they hold exactly what a forward sync would have produced.
-    run_stage(
-        &factory,
-        SenderRecoveryStage::default(),
-        head_num,
-        "sender recovery",
-    )?;
-    run_stage(
-        &factory,
-        TransactionLookupStage::default(),
-        head_num,
-        "transaction lookup",
-    )?;
-
-    // No changesets anywhere, so the segments need the empty-at-head treatment, and every block up
-    // to and including the head has to be marked as having no historical state.
-    init_empty_changeset_segments(&factory, head_num)?;
-    {
-        let provider_rw = factory.database_provider_rw()?;
-        let checkpoint = StageCheckpoint::new(head_num);
-        for stage in StageId::ALL {
-            provider_rw.save_stage_checkpoint(stage, checkpoint)?;
-        }
-        write_snapshot_history_boundaries(&provider_rw, head_num)?;
-        provider_rw
-            .commit()
-            .map_err(|e| eyre::eyre!("commit checkpoints: {e}"))?;
-    }
-
-    verify_head(&factory, head_num, head_hash)?;
-    // A real chain spec means reth's launch check compares against the true genesis, not the head.
-    verify_launch(&factory, genesis_hash)?;
-
-    drop(factory);
-    rename_changeset_files_to_header(&static_files_path)?;
-    for path in [&db_path, &static_files_path, &rocksdb_path] {
-        sync_directory(path)?;
-    }
-    write_snapshot_import_manifest(&args.out, &head)?;
-    Ok(())
 }
 
 fn validate_snapshot_identity(
@@ -1225,18 +1433,80 @@ const BLOCK_STREAM_BUFFER: usize = 16 * 1024 * 1024;
 /// `import-full` path uses, so both streams produce a byte-identical datadir from the same blocks.
 ///
 /// Returns what was written; the caller reads the head header back out of the database.
+/// Where an append picks up: what the datadir already holds, read back out of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BlockResume {
+    /// The block the next chunk must start at. Zero for an untouched datadir.
+    next_block: u64,
+    /// The transaction number the next block's first transaction takes. Static-file receipts and
+    /// recovered senders are keyed by it, so continuing from the wrong value misfiles every one.
+    next_tx_num: u64,
+    /// Whether the headers segment still needs its block range seeded, which is true only for a
+    /// datadir with no headers at all.
+    fresh: bool,
+}
+
+impl BlockResume {
+    const fn beginning() -> Self {
+        Self {
+            next_block: 0,
+            next_tx_num: 0,
+            fresh: true,
+        }
+    }
+}
+
+/// Read what a datadir already holds, so a chunked import can continue where it stopped.
+///
+/// Blocks are committed in batches, so an interrupted chunk leaves a prefix of itself behind. The
+/// highest header is therefore the authority on where to resume, and re-running the same chunk is
+/// safe: everything at or below it is skipped.
+fn read_block_resume<DB: SnapshotDb>(
+    factory: &ProviderFactory<NodeTypesWithDBAdapter<ArbNode, DB>>,
+) -> eyre::Result<BlockResume> {
+    let provider = factory.provider()?;
+    let Some(highest) = provider
+        .static_file_provider()
+        .get_highest_static_file_block(StaticFileSegment::Headers)
+    else {
+        return Ok(BlockResume::beginning());
+    };
+    let indices = provider.block_body_indices(highest)?.ok_or_else(|| {
+        eyre::eyre!("block {highest} has a header but no body indices; the datadir is inconsistent")
+    })?;
+    Ok(BlockResume {
+        next_block: highest + 1,
+        next_tx_num: indices.next_tx_num(),
+        fresh: false,
+    })
+}
+
+/// Import one contiguous run of blocks, appending to whatever the datadir already holds.
+///
+/// Unlike [`write_head_blocks`], which wires a single head block in as though it were genesis, this
+/// builds real block history. Each block is checked against its own header before it is written, and
+/// the writing itself is [`flush_blocks`], the same batching the binary `import-full` path uses, so
+/// both streams produce an identical datadir from the same blocks.
+///
+/// Blocks at or below `resume.next_block` are skipped rather than rejected, which is what makes
+/// re-running an interrupted chunk safe. The first block actually written must be exactly
+/// `resume.next_block`: the static-file segments are indexed by offset from their start, so a gap
+/// would misalign them silently instead of failing.
 fn write_chain_blocks<DB: SnapshotDb>(
     factory: &ProviderFactory<NodeTypesWithDBAdapter<ArbNode, DB>>,
     path: &Path,
+    resume: BlockResume,
 ) -> eyre::Result<BlockSectionStats> {
     let reader = BufReader::with_capacity(BLOCK_STREAM_BUFFER, File::open(path)?);
     let mut stats = BlockSectionStats::default();
     let mut batch: Vec<PendingBlock> = Vec::with_capacity(BLOCK_BATCH);
     let mut pending: Option<PendingBlock> = None;
     let mut batch_txs = 0usize;
-    let mut next_tx_num = 0u64;
-    let mut first = true;
+    let mut next_tx_num = resume.next_tx_num;
+    let mut first = resume.fresh;
     let mut previous: Option<u64> = None;
+    let mut already_present = 0u64;
+    let mut skipping = false;
 
     for (line_index, line) in reader.lines().enumerate() {
         let line_number = line_index + 1;
@@ -1245,13 +1515,19 @@ fn write_chain_blocks<DB: SnapshotDb>(
         };
         match record {
             BlockRecord::Header { number, hash, rlp } => {
-                // Checked before anything is written: the static-file segments index by offset from
-                // their start, so a stream that begins above genesis or skips a block would misalign
-                // them rather than fail.
+                if number < resume.next_block {
+                    // Already in the datadir, from a previous chunk or an interrupted run.
+                    already_present += 1;
+                    skipping = true;
+                    continue;
+                }
+                skipping = false;
                 match previous {
-                    None if number != 0 => eyre::bail!(
-                        "blocks stream starts at {number}, but a whole-chain import needs it to \
-                         start at block 0; re-export with --from 0"
+                    None if number != resume.next_block => eyre::bail!(
+                        "blocks stream starts at {number}, but this datadir needs the next chunk to \
+                         start at block {}; re-export with --from {}",
+                        resume.next_block,
+                        resume.next_block
                     ),
                     Some(previous) if number != previous + 1 => eyre::bail!(
                         "blocks stream jumps from {previous} to {number} at line {line_number}; \
@@ -1280,9 +1556,15 @@ fn write_chain_blocks<DB: SnapshotDb>(
                 pending = Some(block);
             }
             BlockRecord::Body { number, rlp } => {
+                if skipping {
+                    continue;
+                }
                 expect_pending(&mut pending, number, "body")?.attach_body(&rlp)?;
             }
             BlockRecord::Receipts { number, rlp } => {
+                if skipping {
+                    continue;
+                }
                 expect_pending(&mut pending, number, "receipts")?.attach_receipts(&rlp)?;
             }
         }
@@ -1300,7 +1582,22 @@ fn write_chain_blocks<DB: SnapshotDb>(
     )?;
 
     if stats.blocks == 0 {
-        eyre::bail!("no H records in {path:?}");
+        if already_present > 0 {
+            // Re-running a chunk the datadir already has is a no-op, not a failure; a retry loop
+            // should be able to replay the last chunk without special-casing it.
+            tracing::info!(
+                blocks = already_present,
+                "chunk is already imported; nothing to do"
+            );
+        } else {
+            eyre::bail!("no H records in {path:?}");
+        }
+    } else if already_present > 0 {
+        tracing::info!(
+            skipped = already_present,
+            resumed_at = resume.next_block,
+            "chunk overlapped what the datadir already held"
+        );
     }
     Ok(stats)
 }
@@ -2044,7 +2341,7 @@ mod tests {
         let (path, hashes) = chain_blocks_stream(temp.path())?;
         let factory = chain_test_factory();
 
-        let stats = write_chain_blocks(&factory, &path)?;
+        let stats = write_chain_blocks(&factory, &path, BlockResume::beginning())?;
         assert_eq!(stats.blocks, 3);
         assert_eq!(stats.transactions, 2);
         assert_eq!(stats.receipts, 2);
@@ -2084,6 +2381,152 @@ mod tests {
     }
 
     #[test]
+    fn chunks_resume_where_the_previous_one_stopped() -> eyre::Result<()> {
+        use super::super::snapshot_full::tests::{
+            body_rlp, header, receipt_specs, receipts, stored_receipts_rlp, transactions,
+        };
+        use reth_storage_api::{BlockBodyIndicesProvider, ReceiptProvider, TransactionsProvider};
+
+        // Blocks 0..=2 as two chunks split across the block that carries transactions, so the
+        // resume has to carry the transaction numbering across the boundary as well as the height.
+        let txs = transactions();
+        let rcpts = receipts();
+        let h0 = header(0, B256::ZERO, &[], &[]);
+        let h1 = header(1, h0.hash_slow(), &txs, &rcpts);
+        let h2 = header(2, h1.hash_slow(), &[], &[]);
+
+        let temp = tempfile::tempdir()?;
+        let render = |name: &str, blocks: &[(&Header, Option<Vec<u8>>)]| -> eyre::Result<PathBuf> {
+            let mut out = String::new();
+            for (h, receipts) in blocks {
+                out.push_str(&format!(
+                    "H {} {:x} {}\n",
+                    h.number,
+                    h.hash_slow(),
+                    hex::encode(alloy_rlp::encode(*h))
+                ));
+                let body = if h.number == 1 {
+                    body_rlp(&txs)
+                } else {
+                    body_rlp(&[])
+                };
+                out.push_str(&format!("B {} {}\n", h.number, hex::encode(&body)));
+                if let Some(receipts) = receipts {
+                    out.push_str(&format!("R {} {}\n", h.number, hex::encode(receipts)));
+                }
+            }
+            let path = temp.path().join(name);
+            std::fs::write(&path, out)?;
+            Ok(path)
+        };
+
+        let stored = stored_receipts_rlp(&receipt_specs());
+        let chunk_a = render("a.stream", &[(&h0, None), (&h1, Some(stored.clone()))])?;
+        let chunk_b = render("b.stream", &[(&h2, None)])?;
+
+        let factory = chain_test_factory();
+        assert_eq!(read_block_resume(&factory)?, BlockResume::beginning());
+
+        let a = append_blocks(&factory, &chunk_a)?;
+        assert_eq!((a.first_block, a.last_block, a.transactions), (0, 1, 2));
+
+        // The second chunk has to pick up both the height and the transaction numbering.
+        let resume = read_block_resume(&factory)?;
+        assert_eq!(
+            resume,
+            BlockResume {
+                next_block: 2,
+                next_tx_num: 2,
+                fresh: false
+            }
+        );
+
+        let b = append_blocks(&factory, &chunk_b)?;
+        assert_eq!((b.first_block, b.last_block), (2, 2));
+
+        // Replaying a chunk the datadir already holds is a no-op, which is what lets an interrupted
+        // run simply be repeated.
+        let again = append_blocks(&factory, &chunk_a)?;
+        assert_eq!(again.blocks, 0);
+        assert_eq!(read_block_resume(&factory)?.next_block, 3);
+
+        // The result is the same database the one-shot import produces.
+        let provider = factory.provider()?;
+        for (number, expected) in [
+            (0, h0.hash_slow()),
+            (1, h1.hash_slow()),
+            (2, h2.hash_slow()),
+        ] {
+            let sealed = HeaderProvider::sealed_header(&provider, number)?
+                .unwrap_or_else(|| panic!("no header at {number}"));
+            assert_eq!(sealed.hash(), expected, "block {number} hash");
+        }
+        let indices = provider.block_body_indices(1)?.expect("indices at 1");
+        assert_eq!((indices.first_tx_num, indices.tx_count), (0, 2));
+        assert_eq!(
+            provider
+                .block_body_indices(2)?
+                .expect("indices at 2")
+                .first_tx_num,
+            2
+        );
+        assert_eq!(
+            provider
+                .transactions_by_block(1u64.into())?
+                .expect("txs at 1"),
+            txs
+        );
+        assert_eq!(
+            provider
+                .receipts_by_block(1u64.into())?
+                .expect("receipts at 1"),
+            rcpts
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_chunk_that_skips_ahead_of_the_datadir_is_rejected() -> eyre::Result<()> {
+        use super::super::snapshot_full::tests::{body_rlp, header};
+
+        let temp = tempfile::tempdir()?;
+        let h0 = header(0, B256::ZERO, &[], &[]);
+        let h1 = header(1, h0.hash_slow(), &[], &[]);
+        let h2 = header(2, h1.hash_slow(), &[], &[]);
+        let render = |name: &str, hs: &[&Header]| -> eyre::Result<PathBuf> {
+            let mut out = String::new();
+            for h in hs {
+                out.push_str(&format!(
+                    "H {} {:x} {}\nB {} {}\n",
+                    h.number,
+                    h.hash_slow(),
+                    hex::encode(alloy_rlp::encode(*h)),
+                    h.number,
+                    hex::encode(body_rlp(&[]))
+                ));
+            }
+            let path = temp.path().join(name);
+            std::fs::write(&path, out)?;
+            Ok(path)
+        };
+
+        let factory = chain_test_factory();
+        append_blocks(&factory, &render("first.stream", &[&h0])?)?;
+
+        // Block 1 is missing: appending 2 here would leave a hole the segments cannot represent.
+        let error = append_blocks(&factory, &render("skip.stream", &[&h2])?).unwrap_err();
+        assert!(
+            error.to_string().contains("start at block 1"),
+            "unexpected error: {error}"
+        );
+
+        // The chunk that does start there is accepted.
+        append_blocks(&factory, &render("second.stream", &[&h1, &h2])?)?;
+        assert_eq!(read_block_resume(&factory)?.next_block, 3);
+        Ok(())
+    }
+
+    #[test]
     fn a_whole_chain_stream_must_be_contiguous_and_start_at_zero() -> eyre::Result<()> {
         use super::super::snapshot_full::tests::header;
 
@@ -2109,7 +2552,8 @@ mod tests {
 
         // A gap would silently misalign the static-file segments, which index by offset.
         let gap = write("gap.stream", &[h0.clone(), h1.clone(), h3])?;
-        let error = write_chain_blocks(&chain_test_factory(), &gap).unwrap_err();
+        let error =
+            write_chain_blocks(&chain_test_factory(), &gap, BlockResume::beginning()).unwrap_err();
         assert!(
             error.to_string().contains("jumps from 1 to 3"),
             "unexpected error: {error}"
@@ -2117,9 +2561,12 @@ mod tests {
 
         // Starting above genesis leaves the datadir with no block 0 for reth's launch check.
         let headless = write("headless.stream", &[h1])?;
-        let error = write_chain_blocks(&chain_test_factory(), &headless).unwrap_err();
+        let error = write_chain_blocks(&chain_test_factory(), &headless, BlockResume::beginning())
+            .unwrap_err();
         assert!(
-            error.to_string().contains("needs it to start at block 0"),
+            error
+                .to_string()
+                .contains("needs the next chunk to start at block 0"),
             "unexpected error: {error}"
         );
         Ok(())

@@ -534,7 +534,7 @@ fn write_history_boundary(
     Ok(())
 }
 
-fn open_factory(
+pub(crate) fn open_factory(
     db_path: &std::path::Path,
     static_files_path: &std::path::Path,
     rocksdb_path: &std::path::Path,
