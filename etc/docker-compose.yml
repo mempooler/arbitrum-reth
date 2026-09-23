@@ -1,0 +1,110 @@
+name: reth
+
+services:
+  reth:
+    restart: unless-stopped
+    image: reth:local
+    ports:
+      - "127.0.0.1:9001:9001" # metrics
+      - "127.0.0.1:30303:30303" # eth/66 peering
+      - "127.0.0.1:8545:8545" # rpc
+      - "127.0.0.1:8551:8551" # engine
+    volumes:
+      - robinhood_data:/root/.local/share/reth/robinhood
+      - logs:/root/logs
+      - ./config:/root/config/:ro
+    # https://paradigmxyz.github.io/reth/run/troubleshooting.html#concurrent-database-access-error-using-containersdocker
+    pid: host
+    command: >
+      node
+      --datadir /root/.local/share/reth/robinhood
+      --l1-rpc $L1_RPC
+      --l1-beacon $L1_BEACON
+      --l1-getlogs-range 500
+      --l1-prefetch 32
+      --feed-url wss://feed.mainnet.chain.robinhood.com
+      --engine.persistence-threshold 128
+      --engine.memory-block-buffer-target 0
+      --engine.persistence-backpressure-threshold 512
+      --prune.sender-recovery.full
+      --prune.account-history.distance 10064
+      --prune.storage-history.distance 10064
+      --http --http.addr 0.0.0.0 --http.port 8545
+      --http.api "eth,net,web3"
+      --ws --ws.addr 0.0.0.0 --ws.port 8546
+      --ws.api "eth,net,web3"
+      --metrics 0.0.0.0:9001
+      --log.file.directory /root/logs
+      --chain-info /root/config/robinhood-chain-info.json
+      --genesis /root/config/robinhood-genesis.json
+
+  prometheus:
+    restart: unless-stopped
+    image: prom/prometheus
+    depends_on:
+      - reth
+    ports:
+      - 127.0.0.1:9090:9090
+    volumes:
+      - ./prometheus/:/etc/prometheus/
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+
+  loki:
+    restart: unless-stopped
+    image: grafana/loki:latest
+    ports:
+      - 127.0.0.1:3100:3100
+    volumes:
+      - ./loki/:/etc/loki/
+      - loki_data:/loki
+    command: -config.file=/etc/loki/loki.yml
+
+  promtail:
+    restart: unless-stopped
+    image: grafana/promtail:latest
+    depends_on:
+      - loki
+    volumes:
+      - ./promtail/:/etc/promtail/
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: -config.file=/etc/promtail/promtail.yml
+
+  grafana:
+    restart: unless-stopped
+    image: grafana/grafana:latest
+    depends_on:
+      - reth
+      - prometheus
+      - loki
+    ports:
+      - 127.0.0.1:3000:3000
+    environment:
+      PROMETHEUS_URL: ${PROMETHEUS_URL:-http://prometheus:9090}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources
+      - ./grafana/dashboards:/etc/grafana/provisioning_temp/dashboards
+    # 1. Copy dashboards from temp directory to prevent modifying original host files
+    # 2. Replace Prometheus datasource placeholders with the actual name
+    # 3. Run Grafana
+    entrypoint: >
+      sh -c "cp -r /etc/grafana/provisioning_temp/dashboards/. /etc/grafana/provisioning/dashboards &&
+             find /etc/grafana/provisioning/dashboards/ -name '*.json' -exec sed -i 's/$${DS_PROMETHEUS}/Prometheus/g' {} \+ &&
+             find /etc/grafana/provisioning/dashboards/ -name '*.json' -exec sed -i 's/$${datasource}/Prometheus/g' {} \+ &&
+             find /etc/grafana/provisioning/dashboards/ -name '*.json' -exec sed -i 's/$${VAR_INSTANCE_LABEL}/instance/g' {} \+ &&
+             /run.sh"
+
+volumes:
+  robinhood_data:
+    driver: local
+  logs:
+    driver: local
+  prometheus_data:
+    driver: local
+  loki_data:
+    driver: local
+  grafana_data:
+    driver: local
